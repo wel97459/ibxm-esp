@@ -115,4 +115,8 @@ int calculate_mix_buf_len( int sample_rate );
 
 int replay_calculate_tick_len( struct replay *replay);
 
+struct ibxm_player * play_module(struct data *d, int sample_rate, int interpolation);
+struct ibxm_player * openFile(char *filename, int sample_rate, int interpolation);
+struct ibxm_player * openArray(const uint8_t *dataIn, uint32_t len, int sample_rate, int interpolation);
+
 #endif

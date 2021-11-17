@@ -1943,7 +1943,8 @@ int replay_get_audio( struct replay *replay, int *mix_buf, int tick_len ) {
 
 struct ibxm_player * play_module(struct data *d, int sample_rate, int interpolation) {
 	struct ibxm_player *player;
-
+	player = (struct ibxm_player *) malloc(sizeof(struct ibxm_player));
+	assert(player);
     /* Initialise replay.*/
     LOGI(TAG, "Largest free block left: %u", heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM));
     player->module = module_load(&d);
