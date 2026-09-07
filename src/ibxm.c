@@ -7,13 +7,279 @@
 #include "esp_spi_flash.h"
 #include "esp_err.h"
 #include "esp_log.h"
+#include "esp32-hal-psram.h"   /* psramFound() in Arduino-ESP32 core */
+
+#include <assert.h>
 
 #include "ibxm.h"
 
 #define TAG "IBXM_LIB"
 
+/* Logging compat: define LOGI/LOGW/LOGE if the surrounding build (Arduino
+   PlatformIO) has not supplied them. ESP-IDF builds provide ESP_LOGx, so guard
+   is on the macro name. */
+#ifndef LOGI
+#define LOGI( tag, fmt, ... ) ESP_LOGI( tag, fmt, ##__VA_ARGS__ )
+#define LOGW( tag, fmt, ... ) ESP_LOGW( tag, fmt, ##__VA_ARGS__ )
+#define LOGE( tag, fmt, ... ) ESP_LOGE( tag, fmt, ##__VA_ARGS__ )
+#endif
+
 const char *IBXM_VERSION = "ibxm/ac mod/xm/s3m replay 20190513 (c)mumart@gmail.com";
 
+/* Allocation strategy (ESP32):
+   - PCM sample data (sample->data) is read on EVERY sample in the resample
+     inner loop, so it is the genuine HOT path. Keep it in internal DRAM
+     (lowest-latency, cached) and only fall back to PSRAM when DRAM is full.
+   - The raw module file (d.buffer) is COLD: read exactly once during
+     module_load() then freed, so it belongs in PSRAM to save DRAM.
+   Control structures (module/patterns/replay/channels/ramp_buf) use plain
+   calloc() (internal DRAM) via the caller.
+
+   Both helpers probe psramFound() at runtime (not a compile flag) so the split
+   works whenever PSRAM is actually present, regardless of board/menuconfig. */
+static void* ibxm_calloc_dram( size_t num, size_t size ) {
+	/* Hot path: prefer internal DRAM, fall back to PSRAM if DRAM exhausted. */
+	void* p = calloc( num, size );
+#ifdef CONFIG_SPIRAM_SUPPORT
+	if( !p && psramFound() ) {
+		p = heap_caps_calloc( num, size, MALLOC_CAP_SPIRAM );
+	}
+#endif
+	return p;
+}
+
+/* Cold buffer (raw module file): prefer PSRAM, fall back to DRAM. */
+static void* ibxm_calloc_psram( size_t num, size_t size ) {
+	void* p = NULL;
+#ifdef CONFIG_SPIRAM_SUPPORT
+	if( psramFound() ) {
+		p = heap_caps_calloc( num, size, MALLOC_CAP_SPIRAM );
+	}
+#endif
+	if( !p ) {
+		p = calloc( num, size );
+	}
+	return p;
+}
+
+/* Forward declarations for the data-access helpers defined later in this
+   file (data_u8, data_s8, data_sam_s8, data_sam_s16le). The streaming helpers
+   below call them and are placed before those definitions. */
+static int data_u8( struct data *data, int offset );
+static int data_s8( struct data *data, int offset );
+static void data_sam_s8( struct data *data, int offset, int count, short *dest );
+static void data_sam_s16le( struct data *data, int offset, int count, short *dest );
+
+/* ---- On-demand streaming for DRAM-constrained ESP32 (no usable PSRAM) ----
+   When module->stream is set (openArray / flash-mmap path), PCM samples and
+   pattern tables are NOT all resident at once. Each is decoded from the
+   durable module source (module->src, i.e. the flash mmap) on first use and
+   evicted under a small LRU when the DRAM budget is exceeded. This keeps the
+   peak footprint of a ~350 KB S3M (PCM + patterns) well under the ~280 KB
+   free internal DRAM. */
+
+/* ===========================================================================
+   Streaming vs. eager decode
+   ---------------------------------------------------------------------------
+   IBXM_STREAMING (default 1): decode PCM samples and pattern tables on demand
+   from the durable module source (flash mmap) with an LRU working set. Needed
+   when PSRAM is unavailable (e.g. this board, where PSRAM SCLK is not on the
+   SPI0 bus) and the whole S3M cannot fit in internal DRAM at once.
+
+   Set -DIBXM_STREAMING=0 for a board with working PSRAM: the module is decoded
+   eagerly into PSRAM at load (cheap, no per-tick ensure_* calls).
+   =========================================================================== */
+#ifndef IBXM_STREAMING
+#define IBXM_STREAMING 1
+#endif
+
+#if IBXM_STREAMING
+#ifndef IBXM_SAMPLE_CACHE_BYTES
+/* Decoded-PCM budget in internal DRAM. Tuned to the ~51 KB free DRAM on this
+   PSRAM-less board. */
+#define IBXM_SAMPLE_CACHE_BYTES (30 * 1024)
+#endif
+#ifndef IBXM_MAX_RESIDENT_PATTERNS
+/* At most this many patterns unpacked at once (each ~ num_channels*64*5 B). */
+#define IBXM_MAX_RESIDENT_PATTERNS 2
+#endif
+
+static int g_stream_tick = 0;  /* monotonic counter for LRU ordering */
+#endif /* IBXM_STREAMING */
+
+
+#if IBXM_STREAMING
+/* Decode one sample's PCM from module->src into sample->data (DRAM). Returns
+   0 on success, -1 on alloc failure. Caller must hold valid module->src. */
+static int decode_sample( struct module *module, struct sample *sample ) {
+	struct data *d = module->src;
+	int sample_length = sample->src_length;
+	sample->data = ibxm_calloc_dram( sample_length + 1, sizeof( short ) );
+	if( !sample->data ) {
+		return -1;
+	}
+	if( sample->sixteen_bit ) {
+		data_sam_s16le( d, sample->src_offset, sample_length, sample->data );
+	} else {
+		data_sam_s8( d, sample->src_offset, sample_length, sample->data );
+	}
+	if( !sample->is_signed ) {
+		int idx;
+		for( idx = 0; idx < sample_length; idx++ ) {
+			sample->data[ idx ] = ( sample->data[ idx ] & 0xFFFF ) - 32768;
+		}
+	}
+	sample->data[ sample->loop_start + sample->loop_length ] = sample->data[ sample->loop_start ];
+	return 0;
+}
+
+/* Evict least-recently-used decoded samples whose in_use==0 until the decoded
+   PCM working set is under budget. Returns bytes currently resident. */
+static int sample_cache_resident_bytes( struct module *module ) {
+	int total = 0, ins, sam;
+	for( ins = 0; ins <= module->num_instruments; ins++ ) {
+		struct instrument *instrument = &module->instruments[ ins ];
+		if( !instrument->samples ) continue;
+		for( sam = 0; sam < instrument->num_samples; sam++ ) {
+			struct sample *s = &instrument->samples[ sam ];
+			if( s->data && s->in_use == 0 ) {
+				total += ( s->src_length + 1 ) * (int)sizeof( short );
+			}
+		}
+	}
+	return total;
+}
+
+static void sample_cache_evict( struct module *module, int budget ) {
+	int resident = sample_cache_resident_bytes( module );
+	while( resident > budget ) {
+		/* Find LRU not-in-use decoded sample. */
+		struct sample *victim = NULL;
+		int best = 0x7FFFFFFF, ins, sam;
+		for( ins = 0; ins <= module->num_instruments; ins++ ) {
+			struct instrument *instrument = &module->instruments[ ins ];
+			if( !instrument->samples ) continue;
+			for( sam = 0; sam < instrument->num_samples; sam++ ) {
+				struct sample *s = &instrument->samples[ sam ];
+				if( s->data && s->in_use == 0 && s->lru < best ) {
+					best = s->lru; victim = s;
+				}
+			}
+		}
+		if( !victim ) break;  /* nothing evictable (all in use) */
+		resident -= ( victim->src_length + 1 ) * (int)sizeof( short );
+		free( victim->data );
+		victim->data = NULL;
+	}
+}
+
+/* Ensure a sample is decoded and resident. */
+static int ensure_sample( struct module *module, struct sample *sample ) {
+	if( !module->stream ) {
+		/* Eager mode: data was decoded at load time. */
+		return sample->data ? 0 : -1;
+	}
+	if( sample->data ) {
+		sample->lru = g_stream_tick++;
+		return 0;
+	}
+	if( decode_sample( module, sample ) != 0 ) {
+		/* Budget may be exceeded; evict and retry once. */
+		sample_cache_evict( module, IBXM_SAMPLE_CACHE_BYTES );
+		if( decode_sample( module, sample ) != 0 ) {
+			ESP_LOGE(TAG, "ensure_sample: decode failed (DRAM exhausted)");
+			return -1;
+		}
+	}
+	sample->lru = g_stream_tick++;
+	return 0;
+}
+
+/* Unpack one pattern from the source into pattern->data (DRAM), evicting the
+   LRU resident pattern if the resident count would exceed the limit. Uses the
+   channel map stored in the module (identical to eager-load mapping). */
+static int ensure_pattern( struct module *module, int pat ) {
+	struct pattern *p = &module->patterns[ pat ];
+	if( !module->stream ) {
+		return p->data ? 0 : -1;
+	}
+	if( p->data ) {
+		p->lru = g_stream_tick++;
+		return 0;
+	}
+	/* Count currently-unpacked patterns; evict LRU if at the cap. */
+	int resident = 0, idx, victim_idx = -1, best = 0x7FFFFFFF;
+	for( idx = 0; idx < module->num_patterns; idx++ ) {
+		if( module->patterns[ idx ].data ) {
+			resident++;
+			if( module->patterns[ idx ].lru < best ) {
+				best = module->patterns[ idx ].lru; victim_idx = idx;
+			}
+		}
+	}
+	if( resident >= IBXM_MAX_RESIDENT_PATTERNS && victim_idx >= 0 ) {
+		free( module->patterns[ victim_idx ].data );
+		module->patterns[ victim_idx ].data = NULL;
+	}
+	struct data *d = module->src;
+	int num_channels = p->num_channels;
+	char *pattern_data = ibxm_calloc_dram( num_channels * 64, 5 );
+	if( !pattern_data ) {
+		ESP_LOGE(TAG, "ensure_pattern: alloc failed pat=%d", pat);
+		return -1;
+	}
+	p->data = pattern_data;
+	int pat_offset = p->packed_offset;
+	int row = 0, token, key, ins, volume, effect, param, chan;
+	while( row < 64 ) {
+		token = data_u8( d, pat_offset++ );
+		if( token ) {
+			key = ins = 0;
+			if( ( token & 0x20 ) == 0x20 ) {
+				key = data_u8( d, pat_offset++ );
+				ins = data_u8( d, pat_offset++ );
+				if( key < 0xFE ) {
+					key = ( key >> 4 ) * 12 + ( key & 0xF ) + 1;
+				} else if( key == 0xFF ) {
+					key = 0;
+				}
+			}
+			volume = 0;
+			if( ( token & 0x40 ) == 0x40 ) {
+				volume = ( data_u8( d, pat_offset++ ) & 0x7F ) + 0x10;
+				if( volume > 0x50 ) {
+					volume = 0;
+				}
+			}
+			effect = param = 0;
+			if( ( token & 0x80 ) == 0x80 ) {
+				effect = data_u8( d, pat_offset++ );
+				param = data_u8( d, pat_offset++ );
+				if( effect < 1 || effect >= 0x40 ) {
+					effect = param = 0;
+				} else if( effect > 0 ) {
+					effect += 0x80;
+				}
+			}
+			chan = module->channel_map[ token & 0x1F ];
+			if( chan >= 0 ) {
+				int note_offset = ( row * num_channels + chan ) * 5;
+				pattern_data[ note_offset     ] = key;
+				pattern_data[ note_offset + 1 ] = ins;
+				pattern_data[ note_offset + 2 ] = volume;
+				pattern_data[ note_offset + 3 ] = effect;
+				pattern_data[ note_offset + 4 ] = param;
+			}
+		} else {
+			row++;
+		}
+	}
+	p->lru = g_stream_tick++;
+	return 0;
+}
+
+
+#endif /* IBXM_STREAMING */
 static const int FP_SHIFT = 15, FP_ONE = 32768, FP_MASK = 32767;
 
 static const int exp2_table[] = {
@@ -190,7 +456,7 @@ static void sample_ping_pong( struct sample *sample ) {
 	int loop_length = sample->loop_length;
 	int loop_end = loop_start + loop_length;
 	short *sample_data = sample->data;
-	short *new_data = calloc( loop_end + loop_length + 1, sizeof( short ) );
+	short *new_data = ibxm_calloc_dram( loop_end + loop_length + 1, sizeof( short ) );
 	if( new_data ) {
 		memcpy( new_data, sample_data, loop_end * sizeof( short ) );
 		for( idx = 0; idx < loop_length; idx++ ) {
@@ -240,7 +506,7 @@ void dispose_module( struct module *module ) {
 	LOGI(TAG, "Freeing done.");
 }
 
-static struct module* module_load_xm( struct data *data) {
+static struct module* module_load_xm( struct data *data, int stream) {
 	int delta_env, offset, next_offset, idx, entry;
 	int num_rows, num_notes, pat_data_len, pat_data_offset;
 	int sam, sam_head_offset, sam_data_bytes, sam_data_samples;
@@ -312,14 +578,22 @@ static struct module* module_load_xm( struct data *data) {
 			offset += data_u32le( data, offset );
 			next_offset = offset + pat_data_len;
 			num_notes = num_rows * module->num_channels;
+			module->patterns[ idx ].num_channels = module->num_channels;
+			module->patterns[ idx ].num_rows = num_rows;
+			module->patterns[ idx ].data = NULL;
+			if( module->stream ) {
+				/* Streaming: don't unpack now. Record the packed source offset
+				   so ensure_pattern() can unpack on demand. */
+				module->patterns[ idx ].packed_offset = offset;
+				offset = next_offset;
+				continue;
+			}
 			pattern_data = calloc( num_notes+1, 5 );
 			if( !pattern_data ) {
 				dispose_module( module );
 				ESP_LOGE(TAG, "pattern_data Failed");
 				return NULL;
 			}
-			module->patterns[ idx ].num_channels = module->num_channels;
-			module->patterns[ idx ].num_rows = num_rows;
 			module->patterns[ idx ].data = pattern_data;
 			if( pat_data_len > 0 ) {
 				pat_data_offset = 0;
@@ -444,7 +718,20 @@ static struct module* module_load_xm( struct data *data) {
 				}
 				sample->loop_start = sam_loop_start;
 				sample->loop_length = sam_loop_length;
-				sample->data = calloc( sam_data_samples + 1, sizeof( short ) );
+#if IBXM_STREAMING
+				/* Streaming: record source params, defer decode to
+				   ensure_sample() on first channel_trigger. */
+				if( module->stream ) {
+					sample->src_offset = offset;
+					sample->src_length = sam_data_samples;
+					sample->sixteen_bit = sixteen_bit;
+					sample->is_signed = 1;  /* S3M samples are signed */
+					sample->data = NULL;
+					offset += sam_data_bytes;
+					continue;
+				}
+#endif
+				sample->data = ibxm_calloc_dram( sam_data_samples + 1, sizeof( short ) );
 				if( sample->data ) {
 					if( sixteen_bit ) {
 						data_sam_s16le( data, offset, sam_data_samples, sample->data );
@@ -473,7 +760,7 @@ static struct module* module_load_xm( struct data *data) {
 	return module;
 }
 
-static struct module* module_load_s3m( struct data *data) {
+static struct module* module_load_s3m( struct data *data, int stream) {
 	int idx, module_data_idx, inst_offset, flags;
 	int version, sixteen_bit, tune, signed_samples;
 	int stereo_mode, default_pan, channel_map[ 32 ];
@@ -498,6 +785,10 @@ static struct module* module_load_s3m( struct data *data) {
 			dispose_module( module );
 			return NULL;
 		}
+		ESP_LOGE(TAG, "S3M hdr: seq=%d ins=%d pat=%d sig=%08x gvol=%d",
+		         module->sequence_len, module->num_instruments,
+		         module->num_patterns, (unsigned)data_u32le(data,44),
+		         module->default_gvol);
 		module->default_gvol = data_u8( data, 48 );
 		module->default_speed = data_u8( data, 49 );
 		module->default_tempo = data_u8( data, 50 );
@@ -510,9 +801,16 @@ static struct module* module_load_s3m( struct data *data) {
 			if( data_u8( data, 64 + idx ) < 16 ) {
 				channel_map[ idx ] = module->num_channels++;
 			}
+			module->channel_map[ idx ] = channel_map[ idx ];
 		}
+#if IBXM_STREAMING
+		module->stream = stream;
+		module->src = data;
+#endif
+		ESP_LOGE(TAG, "S3M stream=%d src=%p", stream, (void*)data);
 		module->sequence = calloc( module->sequence_len, sizeof( unsigned char ) );
 		if( !module->sequence ){
+			ESP_LOGE(TAG, "S3M sequence calloc FAILED len=%d", module->sequence_len);
 			dispose_module( module );
 			return NULL;
 		}
@@ -522,6 +820,7 @@ static struct module* module_load_s3m( struct data *data) {
 		module_data_idx = 96 + module->sequence_len;
 		module->instruments = calloc( module->num_instruments + 1, sizeof( struct instrument ) );
 		if( !module->instruments ) {
+			ESP_LOGE(TAG, "S3M instruments calloc FAILED num=%d", module->num_instruments);
 			dispose_module( module );
 			return NULL;
 		}
@@ -529,6 +828,7 @@ static struct module* module_load_s3m( struct data *data) {
 		instrument->num_samples = 1;
 		instrument->samples = calloc( 1, sizeof( struct sample ) );
 		if( !instrument->samples ) {
+			ESP_LOGE(TAG, "S3M instruments[0].samples calloc FAILED");
 			dispose_module( module );
 			return NULL;
 		}
@@ -537,11 +837,15 @@ static struct module* module_load_s3m( struct data *data) {
 			instrument->num_samples = 1;
 			instrument->samples = calloc( 1, sizeof( struct sample ) );
 			if( !instrument->samples ) {
+				ESP_LOGE(TAG, "S3M instrument->samples calloc FAILED ins=%d", ins);
 				dispose_module( module );
 				return NULL;
 			}
 			sample = &instrument->samples[ 0 ];
 			inst_offset = data_u16le( data, module_data_idx ) << 4;
+			ESP_LOGE(TAG, "S3M ins=%d inst_offset=%d len=%d taken=%d",
+			         ins, inst_offset, (int)module->sequence_len,
+			         ( data_u8( data, inst_offset ) == 1 && data_u16le( data, inst_offset + 76 ) == 0x4353 ));
 			module_data_idx += 2;
 			data_ascii( data, inst_offset + 48, 28, instrument->name );
 			if( data_u8( data, inst_offset ) == 1 && data_u16le( data, inst_offset + 76 ) == 0x4353 ) {
@@ -570,8 +874,20 @@ static struct module* module_load_s3m( struct data *data) {
 				tune = ( log_2( data_u32le( data, inst_offset + 32 ) ) - log_2( module->c2_rate ) ) * 12;
 				sample->rel_note = tune >> FP_SHIFT;
 				sample->fine_tune = ( tune & FP_MASK ) >> ( FP_SHIFT - 7 );
-				sample->data = calloc( sample_length + 1, sizeof( short ) );
+#if IBXM_STREAMING
+				if( module->stream ) {
+					/* Streaming: record source params, defer decode. */
+					sample->src_offset = sample_offset;
+					sample->src_length = sample_length;
+					sample->sixteen_bit = sixteen_bit;
+					sample->is_signed = signed_samples ? 1 : 0;
+					sample->data = NULL;
+					continue;
+				}
+#endif
+				sample->data = ibxm_calloc_dram( sample_length + 1, sizeof( short ) );
 				if( sample->data ) {
+					ESP_LOGI(TAG, "S3M sample %d len=%d loaded", ins, sample_length);
 					if( sixteen_bit ) {
 						data_sam_s16le( data, sample_offset, sample_length, sample->data );
 					} else {
@@ -583,7 +899,9 @@ static struct module* module_load_s3m( struct data *data) {
 						}
 					}
 					sample->data[ loop_start + loop_length ] = sample->data[ loop_start ];
+					ESP_LOGE(TAG, "S3M ins=%d sample OK len=%d ls=%d ll=%d", ins, sample_length, loop_start, loop_length);
 				} else {
+					ESP_LOGE(TAG, "S3M sample %d alloc FAILED len=%d", ins, sample_length);
 					dispose_module( module );
 					return NULL;
 				}
@@ -591,14 +909,27 @@ static struct module* module_load_s3m( struct data *data) {
 		}
 		module->patterns = calloc( module->num_patterns, sizeof( struct pattern ) );
 		if( !module->patterns ) {
+			ESP_LOGE(TAG, "S3M patterns calloc FAILED num=%d", module->num_patterns);
 			dispose_module( module );
 			return NULL;
 		}
 		for( idx = 0; idx < module->num_patterns; idx++ ) {
 			module->patterns[ idx ].num_channels = module->num_channels;
 			module->patterns[ idx ].num_rows = 64;
-			pattern_data = calloc( module->num_channels * 64, 5 );
+			module->patterns[ idx ].data = NULL;
+#if IBXM_STREAMING
+			if( module->stream ) {
+				/* Streaming: record packed source offset, defer unpack.
+				   Advance module_data_idx exactly as the eager path would. */
+				module->patterns[ idx ].packed_offset =
+					( data_u16le( data, module_data_idx ) << 4 ) + 2;
+				module_data_idx += 2;
+				continue;
+			}
+#endif
+			pattern_data = ibxm_calloc_psram( module->num_channels * 64, 5 );
 			if( !pattern_data ) {
+				ESP_LOGE(TAG, "S3M pattern_data calloc FAILED ch=%d idx=%d", module->num_channels, idx);
 				dispose_module( module );
 				return NULL;
 			}
@@ -678,10 +1009,11 @@ static struct module* module_load_s3m( struct data *data) {
 			return NULL;
 		}
 	}
+	ESP_LOGE(TAG, "S3M LOADED OK module=%p", (void*)module);
 	return module;
 }
 
-static struct module* module_load_mod( struct data *data) {
+static struct module* module_load_mod( struct data *data, int stream) {
 	int idx, pat, module_data_idx, pat_data_len, pat_data_idx;
 	int period, key, ins, effect, param, fine_tune;
 	int sample_length, loop_start, loop_length;
@@ -848,7 +1180,19 @@ static struct module* module_load_mod( struct data *data) {
 			}
 			sample->loop_start = loop_start;
 			sample->loop_length = loop_length;
-			sample->data = calloc( sample_length + 1, sizeof( short ) );
+#if IBXM_STREAMING
+			if( module->stream ) {
+				/* Streaming: record source params, defer decode.
+				   MOD samples are 8-bit unsigned at module_data_idx. */
+				sample->src_offset = module_data_idx;
+				sample->src_length = sample_length;
+				sample->sixteen_bit = 0;
+				sample->is_signed = 0;
+				sample->data = NULL;
+				continue;
+			}
+#endif
+			sample->data = ibxm_calloc_dram( sample_length + 1, sizeof( short ) );
 			if( sample->data ) {
 				data_sam_s8( data, module_data_idx, sample_length, sample->data );
 				sample->data[ loop_start + loop_length ] = sample->data[ loop_start ];
@@ -866,24 +1210,49 @@ static struct module* module_load_mod( struct data *data) {
 /* Allocate and initialize a module from the specified data, returns NULL on error.
    Message should point to a 64-character buffer to receive error messages. */
 struct module* module_load( struct data *data) {
+	return module_load_ex( data, 0 );
+}
+
+struct module* module_load_ex( struct data *data, int stream ) {
 	char ascii[ 16 ];
 	struct module* module;
 	if( !memcmp( data_ascii( data, 0, 16, ascii ), "Extended Module:", 16 ) ) {
-		LOGI(TAG, "Loading XM.");
-		module = module_load_xm( data );
+		ESP_LOGE(TAG, "DISPATCH: XM");
+		module = module_load_xm( data, stream );
 	} else if( !memcmp( data_ascii( data, 44, 4, ascii ), "SCRM", 4 ) ) {
-		LOGI(TAG, "Loading S3M.");
-		module = module_load_s3m( data );
+		ESP_LOGE(TAG, "DISPATCH: S3M sig=%08x", (unsigned)data_u32le(data,44));
+		module = module_load_s3m( data, stream );
+		ESP_LOGE(TAG, "DBG after s3m load free_dram=%u", heap_caps_get_free_size(MALLOC_CAP_8BIT));
 	} else {
-		LOGI(TAG, "Loading MOD.");
-		module = module_load_mod( data );
+		ESP_LOGE(TAG, "DISPATCH: MOD");
+		module = module_load_mod( data, stream );
 	}
+	/* Only the S3M loader sets up streaming (src/stream/channel_map). XM/MOD
+	   decode eagerly and leave module->stream = 0 (calloc-zeroed), so the
+	   ensure_* helpers fall back to the eager path. */
+#if IBXM_STREAMING
+	if( module && module->stream ) {
+		module->src = data;
+	}
+#endif
 	return module;
 }
 
-static void pattern_get_note( struct pattern *pattern, int row, int chan, struct note *dest ) {
+static void pattern_get_note( struct module *module, struct pattern *pattern, int row, int chan, struct note *dest ) {
 	int offset = ( row * pattern->num_channels + chan ) * 5;
 	if( offset >= 0 && row < pattern->num_rows && chan < pattern->num_channels ) {
+#if IBXM_STREAMING
+		if( ensure_pattern( module, (int)( pattern - module->patterns ) ) != 0 ) {
+			static int ep_noisy = 8;
+			if( ep_noisy > 0 ) {
+				ep_noisy--;
+				ESP_LOGE(TAG, "pattern_get_note: ensure_pattern FAILED pat=%d",
+				         (int)(pattern - module->patterns));
+			}
+			memset( dest, 0, sizeof( struct note ) );
+			return;
+		}
+#endif
 		dest->key = pattern->data[ offset ];
 		dest->instrument = pattern->data[ offset + 1 ];
 		dest->volume = pattern->data[ offset + 2 ];
@@ -1070,11 +1439,25 @@ static void channel_retrig_vol_slide( struct channel *channel ) {
 static void channel_trigger( struct channel *channel ) {
 	int key, sam, porta, period, fine_tune, ins = channel->note.instrument;
 	struct sample *sample;
-	if( ins > 0 && ins <= channel->replay->module->num_instruments ) {
-		channel->instrument = &channel->replay->module->instruments[ ins ];
+	struct module *module = channel->replay->module;
+	if( ins > 0 && ins <= module->num_instruments ) {
+		channel->instrument = &module->instruments[ ins ];
 		key = channel->note.key < 97 ? channel->note.key : 0;
 		sam = channel->instrument->key_to_sample[ key ];
 		sample = &channel->instrument->samples[ sam ];
+#if IBXM_STREAMING
+		/* Streaming: ensure the sample PCM is resident before use. Drop the
+		   in_use ref on the previously-bound sample first. */
+		if( channel->sample && channel->sample->in_use > 0 ) {
+			channel->sample->in_use--;
+		}
+		if( ensure_sample( module, sample ) != 0 ) {
+			/* Decode failed (DRAM exhausted); skip this trigger. */
+			channel->sample = &channel->instrument->samples[ 0 ];
+			channel->sample_off = 0;
+			return;
+		}
+#endif
 		channel->volume = sample->volume >= 64 ? 64 : sample->volume & 0x3F;
 		if( sample->panning > 0 ) {
 			channel->panning = ( sample->panning - 1 ) & 0xFF;
@@ -1082,6 +1465,9 @@ static void channel_trigger( struct channel *channel ) {
 		if( channel->period > 0 && sample->loop_length > 1 ) {
 			/* Amiga trigger.*/
 			channel->sample = sample;
+#if IBXM_STREAMING
+			sample->in_use++;
+#endif
 		}
 		channel->sample_off = 0;
 		channel->vol_env_tick = channel->pan_env_tick = 0;
@@ -1674,6 +2060,18 @@ static void replay_row( struct replay *replay ) {
 		replay->break_pos = -1;
 	}
 	pattern = &module->patterns[ module->sequence[ replay->seq_pos ] ];
+	{
+		static int sp_last = -1, sp_noisy = 8;
+		if( replay->seq_pos != sp_last ) {
+			sp_last = replay->seq_pos;
+			if( sp_noisy > 0 ) {
+				sp_noisy--;
+				ESP_LOGE(TAG, "replay_row: seq_pos=%d pat=%d",
+				         replay->seq_pos,
+				         module->sequence[ replay->seq_pos ]);
+			}
+		}
+	}
 	replay->row = replay->next_row;
 	if( replay->row >= pattern->num_rows ) {
 		replay->row = 0;
@@ -1690,7 +2088,7 @@ static void replay_row( struct replay *replay ) {
 	}
 	for( idx = 0; idx < module->num_channels; idx++ ) {
 		channel = &replay->channels[ idx ];
-		pattern_get_note( pattern, replay->row, idx, &note );
+		pattern_get_note( module, pattern, replay->row, idx, &note );
 		if( note.effect == 0xE ) {
 			note.effect = 0x70 | ( note.param >> 4 );
 			note.param &= 0xF;
@@ -1944,48 +2342,55 @@ int replay_get_audio( struct replay *replay, int *mix_buf, int tick_len ) {
 struct ibxm_player * play_module(struct data *d, int sample_rate, int interpolation) {
 	struct ibxm_player *player;
 	player = (struct ibxm_player *) malloc(sizeof(struct ibxm_player));
-	assert(player);
-    /* Initialise replay.*/
-    LOGI(TAG, "Largest free block left: %u", heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM));
-    player->module = module_load(&d);
-    LOGI(TAG, "Largest free block left module : %u", heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM));
-    if(player->module) {
-        /* Perform conversion. */
-       player->replay = new_replay( player->module, sample_rate, interpolation);
-        LOGI(TAG, "Largest free block left replay: %u", heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM));
-        if(player->replay) {
-            player->tick_len = replay_calculate_tick_len( player->replay );
-            player->duration = replay_calculate_duration( player->replay );
-            LOGI(TAG, "Duration: %02i:%02i\n", (player->duration / 1000 / 60 / 60), (player->duration / 1000) % 60);
-            LOGI(TAG, "Tick Len: %i", player->tick_len);
-            return 1;
-        }
-    }
-    return 0;
+	if( !player ) {
+		ESP_LOGE(TAG, "Failed to allocate player");
+		return NULL;
+	}
+	/* Initialise module + replay. */
+	player->module = module_load(d);
+	ESP_LOGE(TAG, "PLAY_MODULE: module=%p channels=%d",
+	         (void*)player->module,
+	         player->module ? player->module->num_channels : -1);
+	if( player->module ) {
+		player->replay = new_replay( player->module, sample_rate, interpolation );
+		ESP_LOGE(TAG, "PLAY_MODULE: replay=%p", (void*)player->replay);
+		if( player->replay ) {
+			player->tick_len = replay_calculate_tick_len( player->replay );
+			player->duration = replay_calculate_duration( player->replay );
+			LOGI(TAG, "Duration: %02i:%02i:%02i",
+				(player->duration / (1000 * 60 * 60)),
+				(player->duration / (1000 * 60)) % 60,
+				(player->duration / 1000) % 60 );
+			LOGI(TAG, "Tick Len: %i", player->tick_len);
+			return player;
+		}
+		dispose_module( player->module );
+	}
+	free( player );
+	return NULL;
 }
 
 struct ibxm_player * openFile(char *filename, int sample_rate, int interpolation) {
-  	static FILE* f;
+ 	static FILE* f;
 	struct data d;
 	struct ibxm_player *player;
 
 	f = fopen(filename, "r");
 	if (f == NULL) {
 		LOGE(TAG, "Failed to open file for reading");
-		return 0;
+		return NULL;
 	}
 	fseek( f , 0L , SEEK_END);
 	d.length = ftell( f );
 	rewind(f);
-	//LOGI(TAG, "mod data len: %u", datalen);
     LOGI(TAG, "Largest free block left: %u", heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM));
-    d.buffer = calloc(d.length,  sizeof(char));
+    d.buffer = ibxm_calloc_psram(d.length,  sizeof(char));
     LOGI(TAG, "Largest free block left: %u", heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM));
 
 	if(d.buffer==NULL) {
-		LOGE(TAG, "Failed to allocate memory for tempData: %u", 32000);
+		LOGE(TAG, "Failed to allocate memory for module data: %u", (unsigned)d.length);
 		fclose(f);
-		return 0;
+		return NULL;
 	}
 
 	fread(d.buffer, sizeof(signed char), d.length, f);
@@ -1994,27 +2399,64 @@ struct ibxm_player * openFile(char *filename, int sample_rate, int interpolation
     LOGI(TAG, "mod_data_len: %i", d.length);
 
 	player = play_module(&d, sample_rate, interpolation);
-	if(player == NULL){
-        dispose_replay( player->replay );
-        dispose_module( player->module );
-        return NULL;
-    }
+	if( player == NULL ) {
+		free(d.buffer);
+		return NULL;
+	}
 	free(d.buffer);
-    return 1;
+    return player;
 }
 
 struct ibxm_player * openArray(const uint8_t *dataIn, uint32_t len, int sample_rate, int interpolation) {
 	struct ibxm_player *player;
 	struct data d;
 
-    d.buffer = dataIn;
+    d.buffer = (char *) dataIn;
     d.length = len;
 
-	player = play_module(&d, sample_rate, interpolation);
-	if(player == NULL){
-        dispose_replay( player->replay );
-        dispose_module( player->module );
-        return NULL;
-    }
-    return 1;
+	/* The buffer here is durable (flash mmap on ESP32, or a const array on
+	   the host), so enable on-demand streaming to keep the S3M's PCM +
+	   pattern tables from all being resident at once. */
+	player = play_module_stream(&d, sample_rate, interpolation, 1);
+	return player;
+}
+
+struct ibxm_player * play_module_stream(struct data *d, int sample_rate, int interpolation, int stream) {
+	struct ibxm_player *player;
+	player = (struct ibxm_player *) malloc(sizeof(struct ibxm_player));
+	if( !player ) {
+		ESP_LOGE(TAG, "Failed to allocate player");
+		return NULL;
+	}
+	player->module = module_load_ex(d, stream);
+	ESP_LOGE(TAG, "PLAY_MODULE: module=%p channels=%d stream=%d",
+	         (void*)player->module,
+	         player->module ? player->module->num_channels : -1,
+	         player->module ? player->module->stream : -1);
+	if( player->module ) {
+		player->replay = new_replay( player->module, sample_rate, interpolation );
+		ESP_LOGE(TAG, "PLAY_MODULE: replay=%p", (void*)player->replay);
+		if( player->replay ) {
+			player->tick_len = replay_calculate_tick_len( player->replay );
+#if IBXM_STREAMING
+			/* Streaming: skip replay_calculate_duration() — it marches the
+			   whole song decoding every sample up front, exhausting the DRAM
+			   sample cache. Replay is already at sequence pos 0 from
+			   new_replay(). */
+			player->duration = 0;
+			LOGI(TAG, "Tick Len: %i (duration skipped in streaming mode)", player->tick_len);
+#else
+			player->duration = replay_calculate_duration( player->replay );
+			LOGI(TAG, "Duration: %02i:%02i:%02i",
+				(player->duration / (1000 * 60 * 60)),
+				(player->duration / (1000 * 60)) % 60,
+				(player->duration / 1000) % 60 );
+			LOGI(TAG, "Tick Len: %i", player->tick_len);
+#endif
+			return player;
+		}
+		dispose_module( player->module );
+	}
+	free( player );
+	return NULL;
 }

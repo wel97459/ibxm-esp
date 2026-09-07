@@ -1,2 +1,6 @@
-.vscode/
-.DS_Store
+.pio/
+.pioenvs/
+.piolibdeps/
+__pycache__/
+.vscode/launch.json
+*.bin

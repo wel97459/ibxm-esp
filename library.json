@@ -1,0 +1,10 @@
+{
+  "name": "ibxm-esp",
+  "version": "1.0.0",
+  "description": "IBXM tracker music decoder (XM/MOD/S3M) with an SPSC ring buffer for ESP32 I2S playback",
+  "keywords": "ibxm, tracker, xm, mod, s3m, i2s, audio, esp32",
+  "homepage": "https://github.com/wel97459/ibxm-esp",
+  "license": "GPL-3.0",
+  "srcDir": "src",
+  "include": "src"
+}

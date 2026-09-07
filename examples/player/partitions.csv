@@ -1,0 +1,9 @@
+# Name,   Type, SubType, Offset,  Size, Flags
+# Keep the standard factory/ota layout; append a raw data partition that holds
+# the XM file. The example loads it via esp_partition_mmap() (no copy to RAM).
+nvs,      data, nvs,     0x9000,  0x5000,
+phy_init, data, phy,     0xe000,  0x1000,
+factory,  app,  factory, 0x10000, 0x1F0000,
+# Raw data partition for the module file. 'music' type=0x40, subtype 0x00.
+# 1 MB is enough for a large XM; raise Size if your file is bigger.
+xm_music, data, 0x40,    ,        0x100000,

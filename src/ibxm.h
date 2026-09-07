@@ -3,13 +3,18 @@
 #ifndef _IBXM_H
 #define _IBXM_H
 
-const char *IBXM_VERSION;
+#include <stdint.h>
 
-#ifdef CONFIG_SPIRAM_SUPPORT
-	#define calloc(num, size) heap_caps_calloc(num, size, MALLOC_CAP_SPIRAM)
-#else
-	#define calloc(num, size) calloc(num, size)
-#endif //CONFIG_SPIRAM_SUPPORT
+extern const char *IBXM_VERSION;
+
+/* Allocation strategy (ESP32):
+   - Control structures (module, patterns, replay, channels, ramp_buf) are kept
+     in internal DRAM because they are touched on every tick in the hot path.
+     Routing them through PSRAM (as the old "#define calloc" did) causes cache
+     misses and hurts throughput.
+   - Large PCM sample data is the real memory hog and is allocated in PSRAM via
+     ibxm_calloc_psram() (see ibxm.c). Fallback to internal DRAM if no PSRAM.
+   We deliberately do NOT redefine the libc calloc() globally. */
 
 struct data {
 	char *buffer;
@@ -20,6 +25,10 @@ struct sample {
 	char name[ 32 ];
 	int loop_start, loop_length;
 	short volume, panning, rel_note, fine_tune, *data;
+	/* Streaming (ESP32 DRAM-constrained) source descriptor. When module->stream
+	   is set, sample->data is decoded lazily from module->src on first use and
+	   evicted under a DRAM budget; the source params are stored here instead. */
+	int src_offset, src_length, sixteen_bit, is_signed, lru, in_use;
 };
 
 struct envelope {
@@ -39,6 +48,10 @@ struct instrument {
 struct pattern {
 	int num_channels, num_rows;
 	char *data;
+	/* Streaming: when module->stream is set, pattern->data is unpacked lazily
+	   from module->src at packed_offset (absolute source byte offset) and
+	   evicted under an LRU of at most IBXM_MAX_RESIDENT_PATTERNS. */
+	int packed_offset, lru, unpacked;
 };
 
 struct module {
@@ -50,6 +63,14 @@ struct module {
 	unsigned char *default_panning, *sequence;
 	struct pattern *patterns;
 	struct instrument *instruments;
+	/* Streaming source: for the openArray (flash-mmap) path this points at the
+	   durable, already-in-memory module data so samples/patterns can be
+	   decoded on demand. */
+	struct data *src;
+	int stream;
+	/* S3M channel map (derived once at load) so patterns can be unpacked on
+	   demand with the identical mapping used during eager load. */
+	int channel_map[ 32 ];
 };
 
 struct note {
@@ -95,6 +116,10 @@ struct ibxm_player {
 /* Allocate and initialize a module from the specified data, returns NULL on error.
    Message should point to a 64-character buffer to receive error messages. */
 struct module* module_load( struct data *data);
+/* stream != 0 enables on-demand decoding of PCM samples and pattern tables
+   from the durable module source (used by the openArray / flash-mmap path on
+   DRAM-constrained ESP32 where PSRAM is unavailable). */
+struct module* module_load_ex( struct data *data, int stream );
 /* Deallocate the specified module. */
 void dispose_module( struct module *module );
 /* Allocate and initialize a replay with the specified module and sampling rate. */
@@ -116,6 +141,7 @@ int calculate_mix_buf_len( int sample_rate );
 int replay_calculate_tick_len( struct replay *replay);
 
 struct ibxm_player * play_module(struct data *d, int sample_rate, int interpolation);
+struct ibxm_player * play_module_stream(struct data *d, int sample_rate, int interpolation, int stream);
 struct ibxm_player * openFile(char *filename, int sample_rate, int interpolation);
 struct ibxm_player * openArray(const uint8_t *dataIn, uint32_t len, int sample_rate, int interpolation);
 

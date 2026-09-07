@@ -3,7 +3,7 @@
 # -- copyright GPLv3
 
 idf_component_register(
-    SRCS "src/ibxm.c"
+    SRCS "src/ibxm.c" "src/ibxm_ring.c"
     INCLUDE_DIRS "src"
 )
 
