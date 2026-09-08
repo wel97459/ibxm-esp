@@ -5,6 +5,10 @@
 
 #include <stdint.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 extern const char *IBXM_VERSION;
 
 /* Allocation strategy (ESP32):
@@ -25,6 +29,10 @@ struct sample {
 	char name[ 32 ];
 	int loop_start, loop_length;
 	short volume, panning, rel_note, fine_tune, *data;
+	/* Number of mono samples in data[] (0 if no wave decoded). Used to decide
+	   whether an instrument is actually playable, independent of the module's
+	   (often padded) instrument count. */
+	int data_length;
 	/* Streaming (ESP32 DRAM-constrained) source descriptor. When module->stream
 	   is set, sample->data is decoded lazily from module->src on first use and
 	   evicted under a DRAM budget; the source params are stored here instead. */
@@ -57,12 +65,15 @@ struct pattern {
 struct module {
 	char name[ 32 ];
 	int num_channels, num_instruments;
+	int num_playable;	/* instruments that actually carry a sample (S3M header
+				   count is often padded; use this for cycling) */
 	int num_patterns, sequence_len, restart_pos;
 	int default_gvol, default_speed, default_tempo, c2_rate, gain;
 	int linear_periods, fast_vol_slides;
 	unsigned char *default_panning, *sequence;
 	struct pattern *patterns;
 	struct instrument *instruments;
+	int seq_muted;  /* HiChord mode: sequencer injects no notes (pattern_get_note returns silence). */
 	/* Streaming source: for the openArray (flash-mmap) path this points at the
 	   durable, already-in-memory module data so samples/patterns can be
 	   decoded on demand. */
@@ -85,6 +96,10 @@ struct channel {
 	int id, key_on, random_seed, pl_row;
 	int sample_off, sample_idx, sample_fra, freq, ampl, pann;
 	int volume, panning, fadeout_vol, vol_env_tick, pan_env_tick;
+	int release_fade;	/* HiChord: per-channel volume fade rate applied after
+				   key-off when the instrument has no volume envelope,
+				   so notes get a release tail instead of cutting dead.
+				   0 = use the instrument's own vol_fadeout (default). */
 	int period, porta_period, retrig_count, fx_count, av_count;
 	int porta_up_param, porta_down_param, tone_porta_param, offset_param;
 	int fine_porta_up_param, fine_porta_down_param, xfine_porta_param;
@@ -144,5 +159,30 @@ struct ibxm_player * play_module(struct data *d, int sample_rate, int interpolat
 struct ibxm_player * play_module_stream(struct data *d, int sample_rate, int interpolation, int stream);
 struct ibxm_player * openFile(char *filename, int sample_rate, int interpolation);
 struct ibxm_player * openArray(const uint8_t *dataIn, uint32_t len, int sample_rate, int interpolation);
+
+/* ---- Direct instrument trigger API (HiChord mode) ----
+   Bypass the file's pattern sequencer: ibxm_sequence_mute() blanks the
+   sequencer (patterns still tick for envelopes/effects but inject no notes),
+   then note_on()/note_off() inject notes straight into replay channels.
+   key = 1..96 (semitones; 60 = middle C), instrument = 1-based index into
+   the module's instrument list. The full voice engine (loops, envelopes,
+   vibrato, volume ramps) runs exactly as in tracker playback. */
+void ibxm_sequence_mute( struct ibxm_player *player );
+void ibxm_sequence_unmute( struct ibxm_player *player );
+void ibxm_restart( struct ibxm_player *player );
+/* Return the next 1-based instrument index >= 1 that actually carries a decoded
+   wave (non-null, non-zero-length sample), starting the search just after
+   `from` and wrapping around. Returns `from` if no other playable instrument
+   exists, so a caller can never spin forever. Robust against padded headers. */
+int ibxm_next_instrument( struct ibxm_player *player, int from );
+/* Copy the name of instrument `ins` (1-based) into `buf` (size `len`, including
+   NUL). Returns buf. Empty string if ins is out of range. */
+char *ibxm_instrument_name( struct ibxm_player *player, int ins, char *buf, int len );
+void ibxm_note_on( struct ibxm_player *player, int channel, int key, int instrument, int volume );
+void ibxm_note_off( struct ibxm_player *player, int channel );
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

@@ -464,6 +464,7 @@ static void sample_ping_pong( struct sample *sample ) {
 		}
 		free( sample->data );
 		sample->data = new_data;
+		if( sample->data_length > 0 ) sample->data_length *= 2;
 		sample->loop_length *= 2;
 		sample->data[ loop_start + sample->loop_length ] = sample->data[ loop_start ];
 	}
@@ -824,6 +825,7 @@ static struct module* module_load_s3m( struct data *data, int stream) {
 			dispose_module( module );
 			return NULL;
 		}
+		module->num_playable = 0;   // count only instruments that actually carry a sample
 		instrument = &module->instruments[ 0 ];
 		instrument->num_samples = 1;
 		instrument->samples = calloc( 1, sizeof( struct sample ) );
@@ -886,6 +888,7 @@ static struct module* module_load_s3m( struct data *data, int stream) {
 				}
 #endif
 				sample->data = ibxm_calloc_dram( sample_length + 1, sizeof( short ) );
+				sample->data_length = sample_length;
 				if( sample->data ) {
 					ESP_LOGI(TAG, "S3M sample %d len=%d loaded", ins, sample_length);
 					if( sixteen_bit ) {
@@ -899,7 +902,8 @@ static struct module* module_load_s3m( struct data *data, int stream) {
 						}
 					}
 					sample->data[ loop_start + loop_length ] = sample->data[ loop_start ];
-					ESP_LOGE(TAG, "S3M ins=%d sample OK len=%d ls=%d ll=%d", ins, sample_length, loop_start, loop_length);
+				module->num_playable++;
+				ESP_LOGE(TAG, "S3M ins=%d sample OK len=%d ls=%d ll=%d", ins, sample_length, loop_start, loop_length);
 				} else {
 					ESP_LOGE(TAG, "S3M sample %d alloc FAILED len=%d", ins, sample_length);
 					dispose_module( module );
@@ -1193,6 +1197,7 @@ static struct module* module_load_mod( struct data *data, int stream) {
 			}
 #endif
 			sample->data = ibxm_calloc_dram( sample_length + 1, sizeof( short ) );
+			sample->data_length = sample_length;
 			if( sample->data ) {
 				data_sam_s8( data, module_data_idx, sample_length, sample->data );
 				sample->data[ loop_start + loop_length ] = sample->data[ loop_start ];
@@ -1240,6 +1245,11 @@ struct module* module_load_ex( struct data *data, int stream ) {
 
 static void pattern_get_note( struct module *module, struct pattern *pattern, int row, int chan, struct note *dest ) {
 	int offset = ( row * pattern->num_channels + chan ) * 5;
+	if( module->seq_muted ) {
+		/* HiChord direct-trigger mode: the sequencer injects no notes. */
+		memset( dest, 0, sizeof( struct note ) );
+		return;
+	}
 	if( offset >= 0 && row < pattern->num_rows && chan < pattern->num_channels ) {
 #if IBXM_STREAMING
 		if( ensure_pattern( module, (int)( pattern - module->patterns ) ) != 0 ) {
@@ -1473,6 +1483,7 @@ static void channel_trigger( struct channel *channel ) {
 		channel->vol_env_tick = channel->pan_env_tick = 0;
 		channel->fadeout_vol = 32768;
 		channel->key_on = 1;
+		channel->release_fade = 0;
 	}
 	if( channel->note.effect == 0x09 || channel->note.effect == 0x8F ) {
 		/* Set Sample Offset. */
@@ -1572,6 +1583,13 @@ static void channel_update_envelopes( struct channel *channel ) {
 		}
 		channel->vol_env_tick = envelope_next_tick( &channel->instrument->vol_env,
 			channel->vol_env_tick, channel->key_on );
+	} else if( !channel->key_on && channel->release_fade > 0 ) {
+		/* HiChord release tail for instruments with no volume envelope: the
+		   engine would otherwise cut to silence instantly on key-off. */
+		channel->fadeout_vol -= channel->release_fade;
+		if( channel->fadeout_vol < 0 ) {
+			channel->fadeout_vol = 0;
+		}
 	}
 	if( channel->instrument->pan_env.enabled ) {
 		channel->pan_env_tick = envelope_next_tick( &channel->instrument->pan_env,
@@ -1617,7 +1635,18 @@ static void channel_calculate_freq( struct channel *channel ) {
 }
 
 static void channel_calculate_ampl( struct channel *channel ) {
-	int vol, range, env_pan = 32, env_vol = channel->key_on ? 64 : 0;
+	int vol, range, env_pan = 32;
+	int env_vol;
+	if( channel->key_on ) {
+		env_vol = 64;
+	} else if( channel->instrument->vol_env.enabled ) {
+		env_vol = 0;	/* envelope handles the release via vol_env_tick */
+	} else {
+		/* No volume envelope: derive a release tail from fadeout_vol so the
+		   note decays instead of cutting dead on key-off (HiChord sustain). */
+		env_vol = channel->fadeout_vol >> 9;	/* 32768 -> 64, 0 -> 0 */
+		if( env_vol > 64 ) env_vol = 64;
+	}
 	if( channel->instrument->vol_env.enabled ) {
 		env_vol = envelope_calculate_ampl( &channel->instrument->vol_env, channel->vol_env_tick );
 	}
@@ -2459,4 +2488,107 @@ struct ibxm_player * play_module_stream(struct data *d, int sample_rate, int int
 	}
 	free( player );
 	return NULL;
+}
+
+/* ---- Direct instrument trigger API (HiChord mode) ---- */
+
+void ibxm_sequence_mute( struct ibxm_player *player ) {
+	if( player && player->module ) {
+		player->module->seq_muted = 1;
+	}
+}
+
+void ibxm_sequence_unmute( struct ibxm_player *player ) {
+	if( player && player->module ) {
+		player->module->seq_muted = 0;
+	}
+}
+
+/* Stop all sounding voices and restart the pattern sequencer from the top. */
+void ibxm_restart( struct ibxm_player *player ) {
+	int i;
+	if( !player || !player->replay ) return;
+	for( i = 0; i < player->module->num_channels; i++ ) {
+		ibxm_note_off( player, i );
+	}
+	replay_set_sequence_pos( player->replay, 0 );
+}
+
+/* An instrument is "available" if it declares at least one sample in its
+   instrument struct (num_samples > 0). We key off the instrument's own
+   num_samples count rather than inspecting each sample's decoded wave, per the
+   HiChord design: any instrument that the module says has samples is selectable. */
+static int instrument_playable( struct module *module, int ins ) {
+	struct instrument *instr;
+	if( ins < 1 || ins > module->num_instruments ) return 0;
+	instr = &module->instruments[ ins ];
+	return instr->num_samples > 0;
+}
+
+/* Return the next 1-based instrument index (>= 1) that carries a real wave,
+   starting the search just after `from` and wrapping at num_instruments.
+   Returns `from` unchanged if no *other* playable instrument exists, so a
+   caller stepping from `from` can never spin forever. Skips instrument 0
+   (the library's reserved empty slot). */
+int ibxm_next_instrument( struct ibxm_player *player, int from ) {
+	int i, n, total;
+	if( !player || !player->module ) return 0;
+	n = player->module->num_instruments;
+	total = n + 1;   /* scan from from+1 through from+n, wrapping, to cover all slots once */
+	for( i = 1; i <= total; i++ ) {
+		int cand = from + i;
+		while( cand > n ) cand -= n;          /* wrap into 1..n */
+		if( cand == 0 ) cand = 1;
+		if( cand == from ) break;              /* covered every slot, none found */
+		if( instrument_playable( player->module, cand ) ) return cand;
+	}
+	return from;
+}
+
+char *ibxm_instrument_name( struct ibxm_player *player, int ins, char *buf, int len ) {
+	if( !buf || len < 1 ) return buf;
+	buf[ 0 ] = '\0';
+	if( !player || !player->module ) return buf;
+	if( ins < 1 || ins > player->module->num_instruments ) return buf;
+	{
+		struct instrument *instr = &player->module->instruments[ ins ];
+		int i, n = 0;
+		for( i = 0; i < 31 && n < len - 1; i++ ) {
+			char c = instr->name[ i ];
+			if( c == '\0' ) break;
+			buf[ n++ ] = c;
+		}
+		buf[ n ] = '\0';
+	}
+	return buf;
+}
+void ibxm_note_on( struct ibxm_player *player, int channel, int key, int instrument, int volume ) {
+	struct note n;
+	if( !player || !player->replay || channel < 0 ||
+			channel >= player->module->num_channels ) {
+		return;
+	}
+	memset( &n, 0, sizeof( struct note ) );
+	n.key = key > 96 ? 96 : ( key < 1 ? 1 : key );
+	n.instrument = instrument > 0 ? instrument : 1;
+	n.volume = volume > 0 ? volume : 0x40;  /* 0x40 = full volume in tracker notation */
+	channel_row( &player->replay->channels[ channel ], &n );
+}
+
+void ibxm_note_off( struct ibxm_player *player, int channel ) {
+	struct note n;
+	if( !player || !player->replay || channel < 0 ||
+			channel >= player->module->num_channels ) {
+		return;
+	}
+	memset( &n, 0, sizeof( struct note ) );
+	n.key = 97;  /* >= 97 = Key Off in the tracker engine */
+	channel_row( &player->replay->channels[ channel ], &n );
+	/* HiChord sustain: instruments without a volume envelope would otherwise cut
+	   to silence the instant the key is released. Give them a short release tail
+	   by arming a per-channel fade (left at 0 for envelope instruments, which
+	   manage their own release). */
+	if( !player->replay->channels[ channel ].instrument->vol_env.enabled ) {
+		player->replay->channels[ channel ].release_fade = 2048;  /* ~0.4s tail */
+	}
 }
