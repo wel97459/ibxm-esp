@@ -1,0 +1,6 @@
+# Name,   Type, SubType, Offset,  Size, Flags
+nvs,      data, nvs,     0x9000,  0x5000,
+phy_init, data, phy,     0xe000,  0x1000,
+factory,  app,  factory, 0x10000, 0x1F0000,
+xm_music, data, 0x40,    ,        0x100000,
+xm_music2,data, 0x40,    0x300000,0x100000,
