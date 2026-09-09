@@ -2514,6 +2514,27 @@ void ibxm_restart( struct ibxm_player *player ) {
 	replay_set_sequence_pos( player->replay, 0 );
 }
 
+/* Authoritative "we are NOT playing the track" state: mute the pattern sequencer
+   so it can never inject notes, then hard-stop every channel. This is the single
+   call the app should make whenever it leaves "play original" mode (init, stop,
+   track load) so a looping/stuck voice from the sequence cannot keep sounding. */
+void ibxm_sequence_stop( struct ibxm_player *player ) {
+	int i;
+	if( !player || !player->replay || !player->module ) return;
+	player->module->seq_muted = 1;
+	for( i = 0; i < player->module->num_channels; i++ ) {
+		ibxm_channel_stop( player, i );
+	}
+}
+
+/* Authoritative "we ARE playing the track" state: unmute the sequencer and
+   restart it from the top. */
+void ibxm_sequence_play( struct ibxm_player *player ) {
+	if( !player || !player->replay || !player->module ) return;
+	player->module->seq_muted = 0;
+	replay_set_sequence_pos( player->replay, 0 );
+}
+
 /* An instrument is "available" if it declares at least one sample in its
    instrument struct (num_samples > 0). We key off the instrument's own
    num_samples count rather than inspecting each sample's decoded wave, per the
@@ -2584,11 +2605,27 @@ void ibxm_note_off( struct ibxm_player *player, int channel ) {
 	memset( &n, 0, sizeof( struct note ) );
 	n.key = 97;  /* >= 97 = Key Off in the tracker engine */
 	channel_row( &player->replay->channels[ channel ], &n );
-	/* Ibmxchord sustain: instruments without a volume envelope would otherwise cut
-	   to silence the instant the key is released. Give them a short release tail
-	   by arming a per-channel fade (left at 0 for envelope instruments, which
-	   manage their own release). */
-	if( !player->replay->channels[ channel ].instrument->vol_env.enabled ) {
-		player->replay->channels[ channel ].release_fade = 2048;  /* ~0.4s tail */
+	/* Ibmxchord: guarantee every released note terminates. Arm a short per-channel
+	   fade regardless of whether the instrument has a volume envelope — some
+	   modules ship vol_fadeout=0, which would otherwise leave a looping sample
+	   sustaining forever. The release_fade branch in channel_update_envelopes runs
+	   for any key-off channel, so this hard-cuts the tail (~0.4s). */
+	player->replay->channels[ channel ].release_fade = 2048;
+}
+
+/* Hard channel stop: fully re-initialise the channel to a silent, idle state.
+   Unlike ibxm_note_off (which only sends a key-off and relies on the instrument's
+   own release/sustain to finish), this zeroes the active voice immediately so a
+   stuck or looping sample on a particular track cannot keep sounding. */
+void ibxm_channel_stop( struct ibxm_player *player, int channel ) {
+	if( !player || !player->replay || channel < 0 ||
+			channel >= player->module->num_channels ) {
+		return;
 	}
+	channel_init( &player->replay->channels[ channel ], player->replay, channel );
+	player->replay->channels[ channel ].key_on = 0;
+	player->replay->channels[ channel ].ampl  = 0;
+	player->replay->channels[ channel ].pann  = 0;
+	player->replay->channels[ channel ].fadeout_vol = 0;
+	player->replay->channels[ channel ].release_fade = 0;
 }

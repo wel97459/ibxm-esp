@@ -169,6 +169,10 @@ struct ibxm_player * openArray(const uint8_t *dataIn, uint32_t len, int sample_r
    vibrato, volume ramps) runs exactly as in tracker playback. */
 void ibxm_sequence_mute( struct ibxm_player *player );
 void ibxm_sequence_unmute( struct ibxm_player *player );
+/* Single authoritative calls for the "not playing" / "playing original" states.
+   stop = mute sequencer + hard-stop all channels; play = unmute + restart. */
+void ibxm_sequence_stop( struct ibxm_player *player );
+void ibxm_sequence_play( struct ibxm_player *player );
 void ibxm_restart( struct ibxm_player *player );
 /* Return the next 1-based instrument index >= 1 that actually carries a decoded
    wave (non-null, non-zero-length sample), starting the search just after
@@ -180,6 +184,9 @@ int ibxm_next_instrument( struct ibxm_player *player, int from );
 char *ibxm_instrument_name( struct ibxm_player *player, int ins, char *buf, int len );
 void ibxm_note_on( struct ibxm_player *player, int channel, int key, int instrument, int volume );
 void ibxm_note_off( struct ibxm_player *player, int channel );
+/* Hard stop: fully re-initialise the channel to silence (key_off alone can leave a
+   looping/stuck voice sounding on some tracks). */
+void ibxm_channel_stop( struct ibxm_player *player, int channel );
 
 #ifdef __cplusplus
 }

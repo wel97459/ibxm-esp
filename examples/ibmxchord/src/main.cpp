@@ -137,7 +137,17 @@ static bool load_module(const char *label) {
 
 // ---- chord triggering ----
 static bool key_held[7];
-static int  key_note[7][4];   // note-keys currently sounding per key (up to 4)
+static int  key_voice[7] = {-1,-1,-1,-1,-1,-1,-1};  // single-note: each key's own channel
+
+// Chord-mode shared voices: at most one chord sounds at a time.
+// The ROOT follows the NEWEST held key; the 3rd/5th follow the ANCHOR (oldest
+// held key). Pressing an extra key while one is held moves only the root; the
+// upper voices re-commit to the new chord only when the anchor is released.
+static int  held_order[7];     // press order of held degrees; -1 = empty slot
+static int  held_count = 0;
+static int  chord_voice_ch[4] = {-1, -1, -1, -1};  // the shared chord voices
+static int  chord_commit_deg = -1;  // anchor: defines 3rd/5th
+static int  chord_root_deg   = -1;  // newest held: defines root
 
 // Ibmxchord "joystick" voicing: 4 directions recolor the held chord (transient,
 // like the real device's joystick). 0=none, 1=Up(flip 3rd), 2=Right(7th),
@@ -150,7 +160,6 @@ static bool single_note = false;  // L+R toggle: true = root-only, false = full 
 static void voicing_offsets(int deg, int v, int out[4], int *n) {
     int t[3] = {CHORD_INT[deg][0], CHORD_INT[deg][1], CHORD_INT[deg][2]}; // 0,3/4/7,7
     *n = 3;
-    if (single_note) { out[0] = t[0]; *n = 1; return; }  // root-only mode
     if (v == 1) {            // Up: flip 3rd (major<->minor)
         t[1] = (t[1] == 4) ? 3 : 4;
     } else if (v == 2) {     // Right: add 7th (maj7/min7)
@@ -171,8 +180,10 @@ static void voicing_offsets(int deg, int v, int out[4], int *n) {
     out[0]=t[0]; out[1]=t[1]; out[2]=t[2];
 }
 
-// In single-note mode, the 7 buttons play successive chord tones spread across
-// octaves: btn 1 = root, 2 = 2nd tone, 3 = 3rd tone, 4 = root+oct, ...
+// In single-note mode each of the 7 buttons plays one chord tone, spread across
+// octaves. The chord tones come from the *current* (D-pad) voicing so a 7th
+// voicing gives 4 tones before wrapping. btn 1 = root, 2 = 2nd tone, 3 = 3rd
+// tone, 4 = root+octave, 5 = 2nd tone+octave, etc.
 // Returns the semitone offset (from the chord root) for the given 1-based button.
 static int single_note_key(int deg, int btn) {
     int offs[4]; int n;
@@ -184,87 +195,144 @@ static int single_note_key(int deg, int btn) {
     return offs[idx] + 12 * oct;
 }
 
-// Re-trigger one key's chord with the given voicing (or base if v==0).
-static void retune_key(int deg, int v) {
-    int base = 24 + key_root + octave * 12 + SCALE_STEPS[deg] + 12;
-    if (base < 1) base = 1;
-    int offs[4]; int n;
-    voicing_offsets(deg, v, offs, &n);
-    for (int i = 0; i < n; i++) {
-        int ch = (i < 4) ? key_chans[deg][i] : -1;
-        if (ch < 0) {
-            // need a spare channel for the 4th voice (7th/add9)
-            for (int c = 0; c < NUM_CHORD_CHANNELS; c++)
-                if (chan_pool[c] == 0) { ch = c; chan_pool[c] = deg + 1; key_chans[deg][i] = c; break; }
-            if (ch < 0) return; // pool exhausted
-        }
+// Compute the set of note-keys for the full chord of degree `deg` at the given
+// voicing. The ROOT pitch comes from `root_deg` (newest key), the 3rd/5th/etc.
+// come from `commit_deg` (the anchor). Returns count in *n.
+static void chord_note_keys(int root_deg, int commit_deg, int v, int out[4], int *n) {
+    int root_base = 24 + key_root + octave * 12 + SCALE_STEPS[root_deg] + 12;
+    int cmt_base  = 24 + key_root + octave * 12 + SCALE_STEPS[commit_deg] + 12;
+    if (root_base  < 1) root_base  = 1;
+    if (cmt_base   < 1) cmt_base   = 1;
+    int offs[4]; int on;
+    voicing_offsets(commit_deg, v, offs, &on);   // shape from the anchor
+    *n = on;
+    for (int i = 0; i < on; i++) {
+        int base = (i == 0) ? root_base : cmt_base;   // root follows newest, rest follow anchor
         int note_key = base + offs[i];
         if (note_key > 96) note_key = 96;
-        key_note[deg][i] = note_key;
-        ibxm_note_on(g_player, ch, note_key, cur_inst, 0x40);
+        out[i] = note_key;
     }
-    // silence any channel beyond n (e.g. dropping back from 7th/add9 to a triad)
+}
+
+// Find a free hardware channel — one not in use by the chord-mode shared voices
+// (chord_voice_ch) NOR by any single-note key voice (key_voice). Returns -1 if
+// none free. 17 channels >> what we use, so we never need to steal.
+static int alloc_chord_voice(void) {
+    for (int c = 0; c < NUM_CHORD_CHANNELS; c++) {
+        bool used = false;
+        for (int i = 0; i < 4; i++) if (chord_voice_ch[i] == c) used = true;
+        for (int k = 0; k < 7; k++) if (key_voice[k] == c) used = true;
+        if (!used) return c;
+    }
+    return -1;
+}
+
+// (Re)trigger the shared chord with the current anchor/root/voicing.
+// Only (re)issues ibxm_note_on for voices whose note actually changed or that are
+// newly allocated — a sustained re-commit (e.g. on a release) must NOT re-attack
+// an already-sounding voice, or you get a double-trigger on every release.
+static int chord_voice_note[4] = {-1, -1, -1, -1};
+static void trigger_chord_now(void) {
+    int out[4]; int n;
+    chord_note_keys(chord_root_deg, chord_commit_deg, active_voicing, out, &n);
+    for (int i = 0; i < n; i++) {
+        int ch = chord_voice_ch[i];
+        bool fresh = false;
+        if (ch < 0) { ch = alloc_chord_voice(); chord_voice_ch[i] = ch; fresh = true; }
+        if (ch < 0) break;
+        if (fresh || chord_voice_note[i] != out[i]) {
+            ibxm_note_on(g_player, ch, out[i], cur_inst, 0x40);
+            chord_voice_note[i] = out[i];
+        }
+    }
+    // silence any surplus voices (e.g. 7th -> triad)
     for (int i = n; i < 4; i++) {
-        int ch = key_chans[deg][i];
-        if (ch >= 0) { ibxm_note_off(g_player, ch); chan_pool[ch] = 0; key_chans[deg][i] = -1; }
+        int ch = chord_voice_ch[i];
+        if (ch >= 0) { ibxm_note_off(g_player, ch); chord_voice_ch[i] = -1; chord_voice_note[i] = -1; }
     }
 }
 
 static void trigger_chord(int deg) {
-    Serial.printf("[key %d down] inst=%d\n", deg + 1, cur_inst); Serial.flush();
-    int base = 24 + key_root + octave * 12 + SCALE_STEPS[deg] + 12;
-    if (base < 1) base = 1;
-    int used = 0;
-    int offs[4]; int n;
-    voicing_offsets(deg, active_voicing, offs, &n); // n = 3 (triad) or 4 (7th/add9)
     if (single_note) {
-        // single-note mode: this button plays one chord tone, spread across octaves
-        offs[0] = single_note_key(deg, deg + 1);
-        n = 1;
-    }
-    // pass 1: re-grab channels this key already owns
-    for (int c = 0; c < NUM_CHORD_CHANNELS && used < n; c++)
-        if (chan_pool[c] == deg + 1) { key_chans[deg][used++] = c; chan_pool[c] = 0; }
-    // pass 2: take free (inactive) channels
-    for (int c = 0; c < NUM_CHORD_CHANNELS && used < n; c++)
-        if (chan_pool[c] == 0) { key_chans[deg][used++] = c; }
-    // pass 3: steal from a NON-held key's channel if still short
-    for (int c = 0; used < n && c < NUM_CHORD_CHANNELS; c++) {
-        if (chan_pool[c] != 0) {
-            int owner = chan_pool[c] - 1;
-            if (!key_held[owner]) { chan_pool[c] = 0; key_chans[deg][used++] = c; }
+        // Each key gets its OWN voice (tracked in key_voice[]) so it releases
+        // independently. No chord_mode shared voices involved.
+        int note = 24 + key_root + octave*12 + SCALE_STEPS[deg] + 12 + single_note_key(deg, deg + 1);
+        if (note > 96) note = 96;
+        int ch = alloc_chord_voice();   // free hardware channel (not in chord_voice_ch)
+        key_voice[deg] = ch;
+        if (ch >= 0) {
+            ibxm_note_on(g_player, ch, note, cur_inst, 0x40);
+            Serial.printf("[sn %d] note=%d ch=%d\n", deg + 1, note, ch);
+        } else {
+            Serial.printf("[sn %d] no free voice\n", deg + 1);
         }
+        Serial.flush();
+        key_held[deg] = true;
+        return;
     }
-    for (int i = 0; i < used; i++) {
-        int ch = key_chans[deg][i];
-        chan_pool[ch] = deg + 1;
-        int note_key = base + offs[i];
-        if (note_key > 96) note_key = 96;
-        key_note[deg][i] = note_key;
-        ibxm_note_on(g_player, ch, note_key, cur_inst, 0x40);
-    }
-    for (int i = used; i < 4; i++) key_chans[deg][i] = -1;
+
+    Serial.printf("[key %d down] inst=%d\n", deg + 1, cur_inst); Serial.flush();
+    // record press order
+    int slot = -1;
+    for (int s = 0; s < 7; s++) if (held_order[s] == -1) { slot = s; break; }
+    if (slot >= 0) held_order[slot] = deg;
+    // anchor = oldest entry; root = newest entry
+    int anchor = -1, newest = -1;
+    for (int s = 0; s < 7; s++) if (held_order[s] != -1) { if (anchor == -1) anchor = held_order[s]; newest = held_order[s]; }
+    bool first = (chord_commit_deg == -1);
+    chord_root_deg   = newest;
+    chord_commit_deg = first ? newest : anchor;
+    trigger_chord_now();
     key_held[deg] = true;
 }
 
 static void release_chord(int deg) {
     Serial.printf("[key %d up]\n", deg + 1); Serial.flush();
-    for (int i = 0; i < 4; i++) {
-        int ch = key_chans[deg][i];
-        if (ch >= 0) {
-            ibxm_note_off(g_player, ch);
-            chan_pool[ch] = 0;
-            key_chans[deg][i] = -1;
+    if (single_note) {
+        int ch = key_voice[deg];
+        if (ch >= 0) { ibxm_note_off(g_player, ch); key_voice[deg] = -1; }
+        key_held[deg] = false;
+        return;
+    }
+
+    // remove this degree from the press order
+    for (int s = 0; s < 7; s++) if (held_order[s] == deg) held_order[s] = -1;
+    // recompute anchor/root from the remaining held keys
+    chord_commit_deg = -1; chord_root_deg = -1;
+    for (int s = 0; s < 7; s++) if (held_order[s] != -1) { if (chord_commit_deg == -1) chord_commit_deg = held_order[s]; chord_root_deg = held_order[s]; }
+    if (chord_commit_deg == -1) {
+        // nothing held: silence and free the shared chord voices
+        for (int i = 0; i < 4; i++) {
+            int ch = chord_voice_ch[i];
+            if (ch >= 0) { ibxm_note_off(g_player, ch); chord_voice_ch[i] = -1; chord_voice_note[i] = -1; }
         }
+    } else {
+        trigger_chord_now();   // re-commit to the new anchor's chord
     }
     key_held[deg] = false;
 }
 
-// Recolor every currently-held chord when the voicing changes.
+// Recolor every currently-held chord when the voicing changes (D-pad).
 static void apply_voicing(int v) {
     active_voicing = v;
-    for (int k = 0; k < 7; k++)
-        if (key_held[k]) retune_key(k, v);
+    if (!single_note && chord_commit_deg != -1) trigger_chord_now();
+}
+
+// Re-strike whatever is currently sounding after a global change (root, octave,
+// instrument, or single-note toggle). In chord mode one shared chord is
+// re-committed; in single-note each held key re-triggers its own voice.
+static void refresh_held(void) {
+    if (single_note) {
+        for (int k = 0; k < 7; k++) if (key_held[k]) {
+            int note = 24 + key_root + octave*12 + SCALE_STEPS[k] + 12 + single_note_key(k, k + 1);
+            if (note > 96) note = 96;
+            int ch = key_voice[k];
+            if (ch < 0) { ch = alloc_chord_voice(); key_voice[k] = ch; }
+            if (ch >= 0) ibxm_note_on(g_player, ch, note, cur_inst, 0x40);
+        }
+    } else if (chord_commit_deg != -1) {
+        trigger_chord_now();
+    }
 }
 
 static const char *NOTE_NAMES[12] = {"C","C#","D","D#","E","F","F#","G","G#","A","A#","B"};
@@ -287,6 +355,9 @@ static void dispose_player(struct ibxm_player *p) {
 // blocked on the ring's semaphore corrupts the wait list and panics, so we never
 // call vTaskDelete() on a running task here.
 static void teardown_audio(void) {
+    if (g_player) {
+        ibxm_sequence_stop(g_player);   // mute sequencer + hard-stop all channels
+    }
     g_running = false;                       // tasks exit their loops on next tick
     uint32_t t0 = millis();
     while ((g_render_task || g_i2s_task) && millis() - t0 < 1000) {
@@ -307,10 +378,14 @@ static bool load_track(void) {
     if (!load_module(TRACK_LABELS[g_track])) { Serial.println("module load failed"); return false; }
     g_ring = ibxm_ring_create(RING_FRAMES, SAMPLE_RATE);
     if (!g_ring) { Serial.println("ring alloc failed"); return false; }
-    ibxm_sequence_mute(g_player);
+    ibxm_sequence_stop(g_player);   // ensure new module starts silent (patterns off)
+    cur_inst = 1;   // reset to the first instrument on every track load
     memset(chan_pool, 0, sizeof(chan_pool));
     memset(key_chans, -1, sizeof(key_chans));
-    for (int k = 0; k < 7; k++) key_held[k] = false;
+    for (int k = 0; k < 7; k++) { key_held[k] = false; held_order[k] = -1; key_voice[k] = -1; }
+    held_count = 0;
+    for (int i = 0; i < 4; i++) { chord_voice_ch[i] = -1; chord_voice_note[i] = -1; }
+    chord_commit_deg = -1; chord_root_deg = -1;
     active_voicing = 0; dpad_v = 0;
     g_running = true;
     xTaskCreatePinnedToCore(render_task, "render", 4096, nullptr, 5, &g_render_task, 1);
@@ -320,12 +395,14 @@ static bool load_track(void) {
 
 // Leave menu / original-playback mode and return to clean Ibmxchord chord mode.
 static void reset_to_ibmxchord(void) {
-    for (int i = 0; i < NUM_CHORD_CHANNELS; i++) ibxm_note_off(g_player, i);
+    ibxm_sequence_stop(g_player);   // mute sequencer + hard-stop all channels
     memset(chan_pool, 0, sizeof(chan_pool));
     memset(key_chans, -1, sizeof(key_chans));
-    for (int k = 0; k < 7; k++) key_held[k] = false;
+    for (int k = 0; k < 7; k++) { key_held[k] = false; held_order[k] = -1; key_voice[k] = -1; }
+    held_count = 0;
+    for (int i = 0; i < 4; i++) { chord_voice_ch[i] = -1; chord_voice_note[i] = -1; }
+    chord_commit_deg = -1; chord_root_deg = -1;
     active_voicing = 0; dpad_v = 0;
-    ibxm_sequence_mute(g_player);   // patterns silent again; our notes only
 }
 
 static void dpad_action(int d) {
@@ -370,7 +447,7 @@ static void scan_buttons() {
                 octave = (octave < 2) ? octave + 1 : -2;
                 Serial.printf("[octave %+d]\n", octave);
             }
-            for (int k = 0; k < 7; k++) if (key_held[k]) retune_key(k, active_voicing);
+            for (int k = 0; k < 7; k++) if (key_held[k]) refresh_held();
             Serial.flush();
         }
         inst_was = ilevel;
@@ -413,21 +490,18 @@ static void scan_buttons() {
         // edge-triggered actions: one per press of L / R / U / D
         bool mL = lf, mR = rt, mU = up && !dn, mD = dn && !up;
         if (mL && !m_l_was) {
-            ibxm_sequence_mute(g_player);
-            for (int i=0;i<NUM_CHORD_CHANNELS;i++) ibxm_note_off(g_player,i);
+            ibxm_sequence_stop(g_player);
+            cur_inst = 1;   // reset to the first instrument on stop
             Serial.printf("[menu] stopped\n"); Serial.flush();
         } else if (mR && !m_r_was) {
-            ibxm_sequence_unmute(g_player);   // <-- must unmute or track stays silent
-            ibxm_restart(g_player);
+            ibxm_sequence_play(g_player);   // unmute + restart from top
             Serial.printf("[menu] playing original\n"); Serial.flush();
         } else if (mU && !m_u_was) {
             g_track = (g_track + 1) % 2;
-            if (load_track()) { ibxm_sequence_mute(g_player);
-                Serial.printf("[menu] track %d: %s\n", g_track+1, TRACK_NAMES[g_track]); Serial.flush(); }
+            if (load_track()) { Serial.printf("[menu] track %d: %s\n", g_track+1, TRACK_NAMES[g_track]); Serial.flush(); }
         } else if (mD && !m_d_was) {
             g_track = (g_track + 1) % 2;
-            if (load_track()) { ibxm_sequence_mute(g_player);
-                Serial.printf("[menu] track %d: %s\n", g_track+1, TRACK_NAMES[g_track]); Serial.flush(); }
+            if (load_track()) { Serial.printf("[menu] track %d: %s\n", g_track+1, TRACK_NAMES[g_track]); Serial.flush(); }
         }
         m_l_was=mL; m_r_was=mR; m_u_was=mU; m_d_was=mD;
         return;
@@ -438,15 +512,15 @@ static void scan_buttons() {
         if (cU && !c_u_was) {
             key_root = (key_root + 1) % 12;
             Serial.printf("[cmenu] root=%s\n", NOTE_NAMES[key_root]); Serial.flush();
-            for (int k=0;k<7;k++) if (key_held[k]) retune_key(k, active_voicing);
+            for (int k=0;k<7;k++) if (key_held[k]) refresh_held();
         } else if (cD && !c_d_was) {
             key_root = (key_root + 11) % 12;
             Serial.printf("[cmenu] root=%s\n", NOTE_NAMES[key_root]); Serial.flush();
-            for (int k=0;k<7;k++) if (key_held[k]) retune_key(k, active_voicing);
+            for (int k=0;k<7;k++) if (key_held[k]) refresh_held();
         } else if (cL && !c_l_was) {
             single_note = !single_note;
             Serial.printf("[cmenu] single_note %s\n", single_note ? "on" : "off"); Serial.flush();
-            for (int k=0;k<7;k++) if (key_held[k]) retune_key(k, active_voicing);
+            for (int k=0;k<7;k++) if (key_held[k]) refresh_held();
         }
         c_u_was=cU; c_d_was=cD; c_l_was=cL;
         return;
@@ -485,7 +559,7 @@ void setup() {
     if (!load_module(TRACK_LABELS[g_track])) { Serial.println("module load failed"); while (1) delay(1000); }
     Serial.printf("[track %d] %s\n", g_track + 1, TRACK_NAMES[g_track]); Serial.flush();
 
-    ibxm_sequence_mute(g_player);  // patterns silent; our notes only
+    ibxm_sequence_stop(g_player);   // mute sequencer + hard-stop all channels at boot
     memset(chan_pool, 0, sizeof(chan_pool));
     memset(key_chans, -1, sizeof(key_chans));
 
