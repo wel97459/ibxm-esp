@@ -1,4 +1,4 @@
-// HiChord — 7 chord keys + 4-way D-pad, playing the REAL tracker engine
+// Ibmxchord — 7 chord keys + 4-way D-pad, playing the REAL tracker engine
 // (ibxm) directly: the S3M's instrument samples, loops, envelopes and
 // volume ramps all run; the file's pattern sequencer is muted and our
 // code injects notes straight into replay channels.
@@ -139,7 +139,7 @@ static bool load_module(const char *label) {
 static bool key_held[7];
 static int  key_note[7][4];   // note-keys currently sounding per key (up to 4)
 
-// HiChord "joystick" voicing: 4 directions recolor the held chord (transient,
+// Ibmxchord "joystick" voicing: 4 directions recolor the held chord (transient,
 // like the real device's joystick). 0=none, 1=Up(flip 3rd), 2=Right(7th),
 // 3=Down(sus4), 4=Left(6th).
 static int active_voicing = 0;
@@ -318,8 +318,8 @@ static bool load_track(void) {
     return true;
 }
 
-// Leave menu / original-playback mode and return to clean HiChord chord mode.
-static void reset_to_hichord(void) {
+// Leave menu / original-playback mode and return to clean Ibmxchord chord mode.
+static void reset_to_ibmxchord(void) {
     for (int i = 0; i < NUM_CHORD_CHANNELS; i++) ibxm_note_off(g_player, i);
     memset(chan_pool, 0, sizeof(chan_pool));
     memset(key_chans, -1, sizeof(key_chans));
@@ -346,7 +346,7 @@ static void scan_buttons() {
     for (int k = 0; k < 7; k++) {
         bool down = digitalRead(KEY_PINS[k]) == LOW;
         if (down && !key_held[k]) {
-            if (menu_mode || chord_menu) { menu_mode=false; chord_menu=false; reset_to_hichord(); Serial.printf("[menu] exit\n"); Serial.flush(); }
+            if (menu_mode || chord_menu) { menu_mode=false; chord_menu=false; reset_to_ibmxchord(); Serial.printf("[menu] exit\n"); Serial.flush(); }
             trigger_chord(k);
         }
         else if (!down && key_held[k]) release_chord(k);
@@ -358,7 +358,7 @@ static void scan_buttons() {
         Serial.printf("[gpio18 raw=%d]\n", ilevel); Serial.flush();
         if (ilevel == LOW) inst_press_t = millis();
         else {
-            if (menu_mode || chord_menu) { menu_mode=false; chord_menu=false; reset_to_hichord(); Serial.printf("[menu] exit\n"); Serial.flush(); }
+            if (menu_mode || chord_menu) { menu_mode=false; chord_menu=false; reset_to_ibmxchord(); Serial.printf("[menu] exit\n"); Serial.flush(); }
             struct module *m = g_player->module;
             if (millis() - inst_press_t < 600) {
                 // step to the next instrument that actually has a decoded wave
@@ -376,7 +376,7 @@ static void scan_buttons() {
         inst_was = ilevel;
     }
 
-    // HiChord joystick = 8 directions. D-pad is 4-way, so we read the X/Y axes
+    // Ibmxchord joystick = 8 directions. D-pad is 4-way, so we read the X/Y axes
     // orthogonally and synthesize diagonals from held pairs (U+L=Up-Left, etc).
     // dir map (0..8): 0=none,1=Up,2=Right,3=Down,4=Left,5=Up-Left,6=Up-Right,
     //                 7=Down-Right,8=Down-Left
@@ -475,7 +475,7 @@ void setup() {
     for (int d = 0; d < 4; d++) pinMode(DPAD_PINS[d], INPUT_PULLUP);
     pinMode(INST_PIN, INPUT_PULLUP);
 
-    Serial.println("[hichord] booting..."); Serial.flush();
+    Serial.println("[ibmxchord] booting..."); Serial.flush();
     if (!psramFound()) Serial.println("WARN: no PSRAM");
 
     if (!init_i2s()) { Serial.println("i2s init failed"); while (1) delay(1000); }
@@ -493,7 +493,7 @@ void setup() {
     xTaskCreatePinnedToCore(render_task, "render", 4096, nullptr, 5, &g_render_task, 1);
     xTaskCreatePinnedToCore(i2s_feed_task, "i2s", 4096, nullptr, 5, &g_i2s_task, 1);
 
-    Serial.printf("[hichord ready] '%s' %d ch, inst=1/%d (of %d hdr), key=C oct=0\n",
+    Serial.printf("[ibmxchord ready] '%s' %d ch, inst=1/%d (of %d hdr), key=C oct=0\n",
                   g_player->module->name, g_player->module->num_channels,
                   g_player->module->num_playable, g_player->module->num_instruments);
     Serial.flush();

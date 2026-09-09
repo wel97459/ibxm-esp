@@ -1246,7 +1246,7 @@ struct module* module_load_ex( struct data *data, int stream ) {
 static void pattern_get_note( struct module *module, struct pattern *pattern, int row, int chan, struct note *dest ) {
 	int offset = ( row * pattern->num_channels + chan ) * 5;
 	if( module->seq_muted ) {
-		/* HiChord direct-trigger mode: the sequencer injects no notes. */
+		/* Ibmxchord direct-trigger mode: the sequencer injects no notes. */
 		memset( dest, 0, sizeof( struct note ) );
 		return;
 	}
@@ -1584,7 +1584,7 @@ static void channel_update_envelopes( struct channel *channel ) {
 		channel->vol_env_tick = envelope_next_tick( &channel->instrument->vol_env,
 			channel->vol_env_tick, channel->key_on );
 	} else if( !channel->key_on && channel->release_fade > 0 ) {
-		/* HiChord release tail for instruments with no volume envelope: the
+		/* Ibmxchord release tail for instruments with no volume envelope: the
 		   engine would otherwise cut to silence instantly on key-off. */
 		channel->fadeout_vol -= channel->release_fade;
 		if( channel->fadeout_vol < 0 ) {
@@ -1643,7 +1643,7 @@ static void channel_calculate_ampl( struct channel *channel ) {
 		env_vol = 0;	/* envelope handles the release via vol_env_tick */
 	} else {
 		/* No volume envelope: derive a release tail from fadeout_vol so the
-		   note decays instead of cutting dead on key-off (HiChord sustain). */
+		   note decays instead of cutting dead on key-off (Ibmxchord sustain). */
 		env_vol = channel->fadeout_vol >> 9;	/* 32768 -> 64, 0 -> 0 */
 		if( env_vol > 64 ) env_vol = 64;
 	}
@@ -2490,7 +2490,7 @@ struct ibxm_player * play_module_stream(struct data *d, int sample_rate, int int
 	return NULL;
 }
 
-/* ---- Direct instrument trigger API (HiChord mode) ---- */
+/* ---- Direct instrument trigger API (Ibmxchord mode) ---- */
 
 void ibxm_sequence_mute( struct ibxm_player *player ) {
 	if( player && player->module ) {
@@ -2517,7 +2517,7 @@ void ibxm_restart( struct ibxm_player *player ) {
 /* An instrument is "available" if it declares at least one sample in its
    instrument struct (num_samples > 0). We key off the instrument's own
    num_samples count rather than inspecting each sample's decoded wave, per the
-   HiChord design: any instrument that the module says has samples is selectable. */
+   Ibmxchord design: any instrument that the module says has samples is selectable. */
 static int instrument_playable( struct module *module, int ins ) {
 	struct instrument *instr;
 	if( ins < 1 || ins > module->num_instruments ) return 0;
@@ -2584,7 +2584,7 @@ void ibxm_note_off( struct ibxm_player *player, int channel ) {
 	memset( &n, 0, sizeof( struct note ) );
 	n.key = 97;  /* >= 97 = Key Off in the tracker engine */
 	channel_row( &player->replay->channels[ channel ], &n );
-	/* HiChord sustain: instruments without a volume envelope would otherwise cut
+	/* Ibmxchord sustain: instruments without a volume envelope would otherwise cut
 	   to silence the instant the key is released. Give them a short release tail
 	   by arming a per-channel fade (left at 0 for envelope instruments, which
 	   manage their own release). */

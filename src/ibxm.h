@@ -73,7 +73,7 @@ struct module {
 	unsigned char *default_panning, *sequence;
 	struct pattern *patterns;
 	struct instrument *instruments;
-	int seq_muted;  /* HiChord mode: sequencer injects no notes (pattern_get_note returns silence). */
+	int seq_muted;  /* Ibmxchord mode: sequencer injects no notes (pattern_get_note returns silence). */
 	/* Streaming source: for the openArray (flash-mmap) path this points at the
 	   durable, already-in-memory module data so samples/patterns can be
 	   decoded on demand. */
@@ -96,7 +96,7 @@ struct channel {
 	int id, key_on, random_seed, pl_row;
 	int sample_off, sample_idx, sample_fra, freq, ampl, pann;
 	int volume, panning, fadeout_vol, vol_env_tick, pan_env_tick;
-	int release_fade;	/* HiChord: per-channel volume fade rate applied after
+	int release_fade;	/* Ibmxchord: per-channel volume fade rate applied after
 				   key-off when the instrument has no volume envelope,
 				   so notes get a release tail instead of cutting dead.
 				   0 = use the instrument's own vol_fadeout (default). */
@@ -160,7 +160,7 @@ struct ibxm_player * play_module_stream(struct data *d, int sample_rate, int int
 struct ibxm_player * openFile(char *filename, int sample_rate, int interpolation);
 struct ibxm_player * openArray(const uint8_t *dataIn, uint32_t len, int sample_rate, int interpolation);
 
-/* ---- Direct instrument trigger API (HiChord mode) ----
+/* ---- Direct instrument trigger API (Ibmxchord mode) ----
    Bypass the file's pattern sequencer: ibxm_sequence_mute() blanks the
    sequencer (patterns still tick for envelopes/effects but inject no notes),
    then note_on()/note_off() inject notes straight into replay channels.
