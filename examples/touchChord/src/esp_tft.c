@@ -146,11 +146,11 @@ bool tft_init(type_lcd_t display, uint16_t height, uint16_t width)
         .pre_cb=tft_spi_pre_transfer_callback,  //Specify pre-transfer callback to handle D/C line
     };
     //Initialize the SPI bus
-    ret=spi_bus_initialize(HSPI_HOST, &buscfg, SPI_DMA_CH_AUTO);
+        ret=spi_bus_initialize(TFT_SPI_HOST, &buscfg, SPI_DMA_CH_AUTO);
     if (ret != ESP_OK) { ESP_LOGE("ESP_LCD", "spi_bus_initialize failed: %s", esp_err_to_name(ret)); return false; }
 
     //Attach the LCD to the SPI bus
-    ret=spi_bus_add_device(HSPI_HOST, &devcfg, &tft_spi);
+    ret=spi_bus_add_device(TFT_SPI_HOST, &devcfg, &tft_spi);
     if (ret != ESP_OK) { ESP_LOGE("ESP_LCD", "spi_bus_add_device failed: %s", esp_err_to_name(ret)); return false; }
 
     //Initialize non-SPI GPIOs

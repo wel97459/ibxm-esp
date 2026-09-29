@@ -46,9 +46,18 @@ static const char *TRACK_NAMES[2]  = {"Space Shell", "i'm back!"};
 static int g_track = 0;  // which partition is currently loaded
 
 // ---- buttons: 7 chord keys + 4 dpad (to GND, internal pullups) ----
-static const uint8_t KEY_PINS[7]  = {1, 2, 3, 4, 8, 10, 13};
-static const uint8_t DPAD_PINS[4] = {14, 15, 16, 17}; // L R U D
-static const uint8_t INST_PIN = 18;                   // cycle instrument (free GPIO, not a strapping pin like GPIO0)
+#ifndef HC_KEY_PINS
+#define HC_KEY_PINS {1, 2, 3, 4, 8, 10, 13}
+#endif
+static const uint8_t KEY_PINS[7]  = HC_KEY_PINS;;
+#ifndef HC_DPAD_PINS
+#define HC_DPAD_PINS {34, 35, 36, 37}
+#endif
+static const uint8_t DPAD_PINS[4] = HC_DPAD_PINS;; // L R U D — GPIO34-37 are input-only on S2, perfect for buttons
+#ifndef HC_INST_PIN
+#define HC_INST_PIN 18
+#endif
+static const uint8_t INST_PIN = HC_INST_PIN;                   // cycle instrument (free GPIO, not a strapping pin like GPIO0)
 
 // ---- music ----
 static const uint8_t SCALE_STEPS[7]  = {0, 2, 4, 5, 7, 9, 11}; // major scale
@@ -575,38 +584,38 @@ static void draw_ui() {
     tft_tile_clear();
 
     // Title / track (palette 1 = light-on-blue)
-    tft_lilfont_printf(0, 0, 1, "Ibmxchord  %s", TRACK_NAMES[g_track]);
+    tft_lilfont_printf(0, 0, 0, "Ibmxchord  %s", TRACK_NAMES[g_track]);
 
     // Key root + octave
-    tft_lilfont_printf(0, 9, 1, "root %s  oct %+d", NOTE_NAMES[key_root], octave);
+    tft_lilfont_printf(0, 9, 0, "root %s  oct %+d", NOTE_NAMES[key_root], octave);
 
     // Current instrument
     char iname[32] = {0};
     if (g_player) ibxm_instrument_name(g_player, cur_inst, iname, sizeof(iname));
-    tft_lilfont_printf(0, 12, 1, "inst %2d %s", cur_inst, iname);
+    tft_lilfont_printf(0, 12, 0, "inst %2d %s", cur_inst, iname);
 
     // Active voicing
-    tft_lilfont_printf(0, 15, 1, "voic %s", VOICE_NAMES[active_voicing]);
+    tft_lilfont_printf(0, 15, 0, "voic %s", VOICE_NAMES[active_voicing]);
 
     // Mode line
     if (single_note)
-        tft_lilfont_printf(0, 18, 3, "SINGLE-NOTE");
+        tft_lilfont_printf(0, 18, 0, "SINGLE-NOTE");
     else if (chord_menu)
-        tft_lilfont_printf(0, 18, 2, "CHORD MENU");
+        tft_lilfont_printf(0, 18, 0, "CHORD MENU");
     else if (menu_mode)
-        tft_lilfont_printf(0, 18, 2, "TRACK PLAY");
+        tft_lilfont_printf(0, 18, 0, "TRACK PLAY");
     else
-        tft_lilfont_printf(0, 18, 2, "CHORD MODE");
+        tft_lilfont_printf(0, 18, 0, "CHORD MODE");
 
     // Held keys as a row of 7 markers (I ii iii IV V vi vii) — highlight when held.
     const char *DEG[7] = {"I","ii","iii","IV","V","vi","vii"};
     for (int k = 0; k < 7; k++) {
-        uint8_t pal = key_held[k] ? 3 : 1;   // palette 3 = bright cyan-ish when held
+        uint8_t pal = key_held[k] ? 0 : 0;   // palette 0 = default
         tft_lilfont_printf(k * 4, 22, pal, "%s", DEG[k]);
     }
 
     // Footer hint
-    tft_lilfont_printf(0, 29, 1, "L+R menu  U+D track  INST=inst/8va");
+    tft_lilfont_printf(0, 29, 0, "L+R menu  U+D track  INST=inst/8va");
 
     // Push the tile map to the panel (one full 240x240 frame).
     for (uint8_t y = 0; y < 30; y++) tft_tile_render(y, 0, 0);
@@ -618,6 +627,7 @@ void setup() {
     for (int d = 0; d < 4; d++) pinMode(DPAD_PINS[d], INPUT_PULLUP);
     pinMode(INST_PIN, INPUT_PULLUP);
 
+    vTaskDelay(5000 / portTICK_RATE_MS);
     Serial.println("[ibmxchord] booting..."); Serial.flush();
     if (!psramFound()) Serial.println("WARN: no PSRAM");
 

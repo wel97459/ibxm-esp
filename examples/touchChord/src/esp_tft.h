@@ -3,6 +3,10 @@
     #include <stddef.h>
     #include "driver/spi_master.h"
 
+#ifndef TFT_SPI_HOST
+#define TFT_SPI_HOST HSPI_HOST
+#endif
+
     #ifdef __cplusplus
     extern "C" {
     #endif
@@ -14,17 +18,19 @@
     } type_lcd_t;
 
     // --- Lolin S2 Mini pin reassignment (touchChord) ---
-    // Free GPIOs after I2S(5/6/7), keys(1/2/3/4/8/10/13), dpad(14/15/16/17), inst(18):
-    // 33,34,35,36,37,38 are unused and all bidirectional on ESP32-S2 (only GPIO46
-    // is input-only). Safe to use for the ST7789 SPI bus.
-    #define PIN_NUM_MISO    34   // display is write-only; left unused
-    #define PIN_NUM_MOSI    35   // SDA (data out)
-    #define PIN_NUM_CLK     36   // SCL (clock)
-    #define PIN_NUM_CS      37   // chip select (active low)
-
-    #define PIN_NUM_DC      38   // data/command
-    #define PIN_NUM_RST     33   // reset (active low)
-    #define PIN_NUM_BCKL    34   // backlight (left unconnected here)
+    // On ESP32-S2, GPIO34-37 are INPUT-ONLY (no output driver), so they're
+    // used for the D-PAD buttons (inputs) — not the display (needs outputs).
+    // Display uses BIDIRECTIONAL GPIOs 14/15/17/21 (free after D-PAD move).
+    // 19/20/22 are NOT broken out on this board, so they are avoided.
+    // The ST7789 panel has NO CS pin (always selected) — PIN_NUM_CS = -1.
+    // 14/15/17 = MOSI/SCLK/DC outputs, 21 = RST output. All bidirectional.
+    #define PIN_NUM_MISO    -1   // display is write-only; no MISO line
+    #define PIN_NUM_MOSI    14   // SDA (data out)
+    #define PIN_NUM_CLK     15   // SCL (clock)
+    #define PIN_NUM_CS      -1   // panel has NO CS pin — always selected, leave unused
+    #define PIN_NUM_DC      17   // data/command
+    #define PIN_NUM_RST     21   // reset (active low)
+    #define PIN_NUM_BCKL    -1   // backlight tied to 3V3 (not driven by firmware)
 
     #define PARALLEL_LINES  16
 
