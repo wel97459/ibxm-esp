@@ -22,12 +22,12 @@
     // used for the D-PAD buttons (inputs) — not the display (needs outputs).
     // Display uses BIDIRECTIONAL GPIOs 14/15/17/21 (free after D-PAD move).
     // 19/20/22 are NOT broken out on this board, so they are avoided.
-    // The ST7789 panel has NO CS pin (always selected) — PIN_NUM_CS = -1.
+    // CS is optional for a single-device SPI bus — GPIO16 drives it when wired.
     // 14/15/17 = MOSI/SCLK/DC outputs, 21 = RST output. All bidirectional.
     #define PIN_NUM_MISO    -1   // display is write-only; no MISO line
     #define PIN_NUM_MOSI    14   // SDA (data out)
     #define PIN_NUM_CLK     15   // SCL (clock)
-    #define PIN_NUM_CS      -1   // panel has NO CS pin — always selected, leave unused
+    #define PIN_NUM_CS      16   // chip select (GPIO16, bidirectional)
     #define PIN_NUM_DC      17   // data/command
     #define PIN_NUM_RST     21   // reset (active low)
     #define PIN_NUM_BCKL    -1   // backlight tied to 3V3 (not driven by firmware)
