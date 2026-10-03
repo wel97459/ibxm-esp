@@ -20,6 +20,8 @@
 #include "esp_tft_bigfont.h" // 8x8 / big font on top of the tile layer
 #include "bigfont_data.c"  // tiles_bigfont[] generated from bigfont.chr
 
+static void ui_task(void*);
+
 #ifndef HC_BCLK
 #define HC_BCLK 5
 #endif
@@ -401,6 +403,7 @@ static bool load_track(void) {
     chord_commit_deg = -1; chord_root_deg = -1;
     active_voicing = 0; dpad_v = 0;
     g_running = true;
+    xTaskCreatePinnedToCore(ui_task, "ui", 8192, nullptr, 1, nullptr, 0);
     xTaskCreatePinnedToCore(render_task, "render", 4096, nullptr, 5, &g_render_task, 1);
     xTaskCreatePinnedToCore(i2s_feed_task, "i2s", 4096, nullptr, 5, &g_i2s_task, 1);
     return true;
@@ -619,6 +622,17 @@ static void draw_ui() {
 
     // Push the tile map to the panel (one full 240x240 frame).
     for (uint8_t y = 0; y < 30; y++) tft_tile_render(y, 0, 0);
+    tft_tile_sendLine(29*8, 0);   // band 29 is composed by the y=29 pass but never sent (each pass sends the previous band)
+}
+
+// UI runs on core 0 so display redraw never competes with the audio
+// pipeline (render + i2s tasks are pinned to core 1).
+static void ui_task(void*) {
+    for (;;) {
+        scan_buttons();
+        draw_ui();
+        vTaskDelay(pdMS_TO_TICKS(5));
+    }
 }
 
 void setup() {
@@ -645,6 +659,7 @@ void setup() {
     memset(key_chans, -1, sizeof(key_chans));
 
     g_running = true;
+    xTaskCreatePinnedToCore(ui_task, "ui", 8192, nullptr, 1, nullptr, 0);
     xTaskCreatePinnedToCore(render_task, "render", 4096, nullptr, 5, &g_render_task, 1);
     xTaskCreatePinnedToCore(i2s_feed_task, "i2s", 4096, nullptr, 5, &g_i2s_task, 1);
 
@@ -654,8 +669,4 @@ void setup() {
     Serial.flush();
 }
 
-void loop() {
-    scan_buttons();
-    draw_ui();
-    vTaskDelay(pdMS_TO_TICKS(5));
-}
+void loop() { vTaskDelay(pdMS_TO_TICKS(1000)); }   // unused: UI runs in ui_task (core 0)

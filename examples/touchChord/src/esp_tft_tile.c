@@ -43,7 +43,10 @@ void tft_tile_sendLine(const uint16_t ypos, const uint8_t field)
         ret=spi_device_queue_trans(tft_spi, &trans[x], portMAX_DELAY);
         assert(ret==ESP_OK);
     }
-    //tft_send_line_finish();
+    { // wait for the 6 queued transactions; buffer is safe to reuse after
+        spi_transaction_t *rtrans;
+        for (uint8_t x=0; x<6; x++) spi_device_get_trans_result(tft_spi, &rtrans, portMAX_DELAY);
+    }
 }
 
 
