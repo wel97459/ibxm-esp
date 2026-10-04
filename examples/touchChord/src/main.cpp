@@ -19,6 +19,7 @@
 #include "esp_tft_tile.h"  // tile + 4-color palette layer
 #include "esp_tft_bigfont.h" // 8x8 / big font on top of the tile layer
 #include "bigfont_data.c"  // tiles_bigfont[] generated from bigfont.chr
+extern "C" const uint8_t gfx_tiles[];   // gui.chr tiles (24 bytes each), from gui_tiles_data.c
 
 static void ui_task(void*);
 
@@ -382,7 +383,7 @@ static void teardown_audio(void) {
     if (g_render_task) { vTaskDelete(g_render_task); g_render_task = nullptr; }
     if (g_i2s_task)    { vTaskDelete(g_i2s_task);    g_i2s_task = nullptr; }
     if (g_ring)   { ibxm_ring_destroy(g_ring); g_ring = nullptr; }
-    if (g_player) { dispose_player(g_player);  g_player = nullptr; }
+    if (g_player) { struct ibxm_player *dead = g_player; g_player = nullptr; dispose_player(dead); }
     if (g_mmap)   { spi_flash_munmap(g_mmap);  g_mmap = 0; }
 }
 
@@ -403,7 +404,9 @@ static bool load_track(void) {
     chord_commit_deg = -1; chord_root_deg = -1;
     active_voicing = 0; dpad_v = 0;
     g_running = true;
-    xTaskCreatePinnedToCore(ui_task, "ui", 8192, nullptr, 1, nullptr, 0);
+    // NOTE: ui_task is created ONCE in setup() and keeps running across
+    // track switches — creating it here again would leak a task and run
+    // two concurrent UI/scan loops (crash on track switch).
     xTaskCreatePinnedToCore(render_task, "render", 4096, nullptr, 5, &g_render_task, 1);
     xTaskCreatePinnedToCore(i2s_feed_task, "i2s", 4096, nullptr, 5, &g_i2s_task, 1);
     return true;
@@ -559,6 +562,49 @@ static void scan_buttons() {
     }
 }
 
+void draw_screen_border(){
+    tft_tile_putWindowGFX(0, 0, 0 | FILP_H_TILE, &gfx_tiles[0x12*0x18]);
+    tft_tile_putWindowGFX(0, 29, 0 | FILP_H_TILE | FILP_V_TILE , &gfx_tiles[0x12*0x18]);
+    tft_tile_putWindowGFX(29, 0, 0, &gfx_tiles[0x12*0x18]);
+    tft_tile_putWindowGFX(29, 29, 0 | FILP_V_TILE, &gfx_tiles[0x12*0x18]);
+
+    for (size_t i = 1; i < 29; i++) {
+        tft_tile_putWindowGFX(i, 0, 0, &gfx_tiles[0x11*0x18]);
+        tft_tile_putWindowGFX(i, 29, 0, &gfx_tiles[0x11*0x18]);
+        tft_tile_putWindowGFX(0, i, 0, &gfx_tiles[0x0f*0x18]);
+        tft_tile_putWindowGFX(29, i, 0, &gfx_tiles[0x0f*0x18]);
+    }
+}
+
+void draw_background_pat(){
+    for (size_t iy = 0; iy < 60; iy++) {
+        for (size_t ix = 0; ix < 60; ix++) {
+            if(iy&0x01){
+                if(ix&0x01){
+                    tft_tile_putGFX(ix, iy, 1, &gfx_tiles[15<<4]);
+                }else{
+                    tft_tile_putGFX(ix, iy, 1, &gfx_tiles[17<<4]);
+                }
+            } else {
+                if(ix&0x01){
+                    tft_tile_putGFX(ix, iy, 1, &gfx_tiles[16<<4]);
+                }else{
+                    tft_tile_putGFX(ix, iy, 1, &gfx_tiles[18<<4]);
+                }
+            }
+        }
+    }
+}
+
+void drawGrid() {
+    for (size_t y = 0; y < 30; y++) {
+        for (size_t x = 0; x < 30; x++) {
+            tft_tile_putBackgoundGFX(x, y, 0, &gfx_tiles[0x13*0x18]);
+        }
+    }
+}
+
+
 // ---- ST7789 240x240 display (reused ESP_TFT + tile + bigfont) ----
 static bool display_ready = false;
 static void display_init() {
@@ -569,10 +615,14 @@ static void display_init() {
     }
     // Tile engine + the exact palette setup from the original ESP_TFT main.c
     tft_tile_init();
-    tft_tile_putPalette(0, TFT_BLACK, TFT_BLACK, tft_color565(0x28, 0x38, 0x88), tft_color565(0x00, 0x00, 0x48));
+    tft_tile_putPalette(0, TFT_BLACK, TFT_BLACK, tft_color565(0x28, 0x38, 0x88), TFT_RED);
     tft_tile_putPalette(1, tft_color565(0x28, 0x38, 0x88), tft_color565(0xF8, 0xF8, 0xF8), tft_color565(0xB8, 0xB8, 0xB8), tft_color565(0x60, 0x60, 0x60));
-    tft_tile_putPalette(2, tft_color565(0x00, 0x00, 0x00), tft_color565(0x00, 0x00, 0xF8), tft_color565(0x00, 0x00, 0xb0), tft_color565(0x00, 0x00, 0x68));
-    tft_tile_putPalette(3, tft_color565(0x00, 0x00, 0x20), tft_color565(0x00, 0x00, 0xd8), tft_color565(0x00, 0x00, 0x90), tft_color565(0x00, 0x00, 0x48));
+    tft_tile_putPalette(2, tft_color565(0x00, 0x00, 0x00), tft_color565(0x88, 0xe8, 0x10), tft_color565(0x00, 0x00, 0xb0), tft_color565(0x00, 0x00, 0x68));
+    tft_tile_putPalette(3, tft_color565(0x00, 0x00, 0x80), tft_color565(0x00, 0x00, 0xd8), tft_color565(0x00, 0x00, 0x90), tft_color565(0x00, 0x00, 0x48));
+
+    draw_screen_border();
+    drawGrid();
+
     Serial.println("[display] ESP_TFT ready");
 }
 
@@ -584,41 +634,47 @@ static void draw_ui() {
     if (millis() - ui_t0 < 120) return;   // ~8 fps refresh
     ui_t0 = millis();
 
-    tft_tile_clear();
+    tft_tile_clear();   // clears the MAIN map only — BG grid (drawGrid) persists
+
+    // Text sits one tile (8px) in from the corner and is transparent so the
+    // background grid shows through. TRANSPARENT_TILE (0x20) makes glyph
+    // background pixels (b==0) keep the layer below.
+    #define TXT_PAL(p) ((p) | TRANSPARENT_TILE)
 
     // Title / track (palette 1 = light-on-blue)
-    tft_lilfont_printf(0, 0, 0, "Ibmxchord  %s", TRACK_NAMES[g_track]);
+    tft_lilfont_printf(1, 1, TXT_PAL(0), "Ibmxchord  %s", TRACK_NAMES[g_track]);
 
     // Key root + octave
-    tft_lilfont_printf(0, 9, 0, "root %s  oct %+d", NOTE_NAMES[key_root], octave);
+    tft_lilfont_printf(1, 10, TXT_PAL(0), "root %s  oct %+d", NOTE_NAMES[key_root], octave);
 
     // Current instrument
     char iname[32] = {0};
     if (g_player) ibxm_instrument_name(g_player, cur_inst, iname, sizeof(iname));
-    tft_lilfont_printf(0, 12, 0, "inst %2d %s", cur_inst, iname);
+    tft_lilfont_printf(1, 13, TXT_PAL(0), "inst %2d %s", cur_inst, iname);
 
     // Active voicing
-    tft_lilfont_printf(0, 15, 0, "voic %s", VOICE_NAMES[active_voicing]);
+    tft_lilfont_printf(1, 16, TXT_PAL(0), "voic %s", VOICE_NAMES[active_voicing]);
 
     // Mode line
     if (single_note)
-        tft_lilfont_printf(0, 18, 0, "SINGLE-NOTE");
+        tft_lilfont_printf(1, 19, TXT_PAL(0), "SINGLE-NOTE");
     else if (chord_menu)
-        tft_lilfont_printf(0, 18, 0, "CHORD MENU");
+        tft_lilfont_printf(1, 19, TXT_PAL(0), "CHORD MENU");
     else if (menu_mode)
-        tft_lilfont_printf(0, 18, 0, "TRACK PLAY");
+        tft_lilfont_printf(1, 19, TXT_PAL(0), "TRACK PLAY");
     else
-        tft_lilfont_printf(0, 18, 0, "CHORD MODE");
+        tft_lilfont_printf(1, 19, TXT_PAL(0), "CHORD MODE");
 
     // Held keys as a row of 7 markers (I ii iii IV V vi vii) — highlight when held.
     const char *DEG[7] = {"I","ii","iii","IV","V","vi","vii"};
     for (int k = 0; k < 7; k++) {
         uint8_t pal = key_held[k] ? 0 : 0;   // palette 0 = default
-        tft_lilfont_printf(k * 4, 22, pal, "%s", DEG[k]);
+        tft_lilfont_printf(k * 4 + 1, 23, TXT_PAL(pal), "%s", DEG[k]);
     }
 
-    // Footer hint
-    tft_lilfont_printf(0, 29, 0, "L+R menu  U+D track  INST=inst/8va");
+    // Footer hint (stays on row 29 — shifting it down one more tile would
+    // push it off the 30-row screen)
+    tft_lilfont_printf(1, 29, TXT_PAL(0), "L+R menu  U+D track  INST=inst/8va");
 
     // Push the tile map to the panel (one full 240x240 frame).
     for (uint8_t y = 0; y < 30; y++) tft_tile_render(y, 0, 0);
@@ -629,9 +685,18 @@ static void draw_ui() {
 // pipeline (render + i2s tasks are pinned to core 1).
 static void ui_task(void*) {
     for (;;) {
-        scan_buttons();
         draw_ui();
         vTaskDelay(pdMS_TO_TICKS(5));
+    }
+}
+
+// Button scanning lives on the audio core (core 1): it's a few digitalReads
+// per pass, runs at low priority so audio render always preempts it, and it
+// no longer stalls while the core-0 draw_ui blocks on SPI line transmission.
+static void btn_task(void*) {
+    for (;;) {
+        scan_buttons();
+        vTaskDelay(pdMS_TO_TICKS(2));
     }
 }
 
@@ -660,6 +725,7 @@ void setup() {
 
     g_running = true;
     xTaskCreatePinnedToCore(ui_task, "ui", 8192, nullptr, 1, nullptr, 0);
+    xTaskCreatePinnedToCore(btn_task, "btn", 4096, nullptr, 3, nullptr, 1);
     xTaskCreatePinnedToCore(render_task, "render", 4096, nullptr, 5, &g_render_task, 1);
     xTaskCreatePinnedToCore(i2s_feed_task, "i2s", 4096, nullptr, 5, &g_i2s_task, 1);
 
