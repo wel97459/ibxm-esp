@@ -22,6 +22,15 @@
 extern "C" const uint8_t gfx_tiles[];   // gui.chr tiles (24 bytes each), from gui_tiles_data.c
 
 static void ui_task(void*);
+static bool display_ready = false;
+
+#include "driver/sdspi_host.h"
+#include "sdmmc_cmd.h"
+#include "esp_vfs_fat.h"
+#include <dirent.h>
+
+#define SD_CS_PIN  11   // SD card chip-select (shares SPI bus with display)
+#define SD_MISO_PIN 12  // SD card DO -> bus MISO
 
 #ifndef HC_BCLK
 #define HC_BCLK 5
@@ -78,6 +87,12 @@ static struct ibxm_player *g_player = nullptr;
 static ibxm_ring_t *g_ring = nullptr;
 static volatile bool g_running = false;
 static spi_flash_mmap_handle_t g_mmap;
+static uint8_t *g_sdbuf = nullptr;      // SD track load buffer
+static uint32_t g_sdlen = 0;
+static bool     sd_mounted = false;
+static char     sd_names[16][24];        // track files found on the card
+static char     sd_paths[16][64];
+static int      n_sd = 0;
 static TaskHandle_t g_render_task = nullptr;
 static TaskHandle_t g_i2s_task = nullptr;
 #define NUM_CHORD_CHANNELS 17   // all hardware channels in the pool
@@ -385,13 +400,13 @@ static void teardown_audio(void) {
     if (g_ring)   { ibxm_ring_destroy(g_ring); g_ring = nullptr; }
     if (g_player) { struct ibxm_player *dead = g_player; g_player = nullptr; dispose_player(dead); }
     if (g_mmap)   { spi_flash_munmap(g_mmap);  g_mmap = 0; }
+    if (g_sdbuf)  { free(g_sdbuf); g_sdbuf = nullptr; g_sdlen = 0; }
 }
 
 // Reload the currently-selected track: full pipeline restart so the render task,
 // ring and mmap all point at the new module (U/D in the menu).
-static bool load_track(void) {
-    teardown_audio();
-    if (!load_module(TRACK_LABELS[g_track])) { Serial.println("module load failed"); return false; }
+// Common post-load work: fresh ring + tasks + silent sequencer + clean chord state.
+static bool start_pipeline(void) {
     g_ring = ibxm_ring_create(RING_FRAMES, SAMPLE_RATE);
     if (!g_ring) { Serial.println("ring alloc failed"); return false; }
     ibxm_sequence_stop(g_player);   // ensure new module starts silent (patterns off)
@@ -404,12 +419,17 @@ static bool load_track(void) {
     chord_commit_deg = -1; chord_root_deg = -1;
     active_voicing = 0; dpad_v = 0;
     g_running = true;
-    // NOTE: ui_task is created ONCE in setup() and keeps running across
-    // track switches — creating it here again would leak a task and run
-    // two concurrent UI/scan loops (crash on track switch).
+    // NOTE: ui_task + btn_task are created ONCE in setup() and keep running
+    // across track switches — recreating them here would leak tasks.
     xTaskCreatePinnedToCore(render_task, "render", 4096, nullptr, 5, &g_render_task, 1);
     xTaskCreatePinnedToCore(i2s_feed_task, "i2s", 4096, nullptr, 5, &g_i2s_task, 1);
     return true;
+}
+
+static bool load_track(void) {
+    teardown_audio();
+    if (!load_module(TRACK_LABELS[g_track])) { Serial.println("module load failed"); return false; }
+    return start_pipeline();
 }
 
 // Leave menu / original-playback mode and return to clean Ibmxchord chord mode.
@@ -431,120 +451,293 @@ static void dpad_action(int d) {
     Serial.flush();
 }
 
+// ---- SD card (shares the display SPI bus) ----
+static void mount_sd(void) {
+    if (!display_ready) return;                 // SPI bus must be up first
+    sdmmc_host_t host = SDSPI_HOST_DEFAULT();
+    host.slot = (spi_host_device_t)TFT_SPI_HOST;
+    sdspi_device_config_t slot = SDSPI_DEVICE_CONFIG_DEFAULT();
+    slot.gpio_cs = (gpio_num_t)SD_CS_PIN;
+    slot.host_id = (spi_host_device_t)TFT_SPI_HOST;
+    esp_vfs_fat_sdmmc_mount_config_t mc = {};
+    mc.format_if_mount_failed = false;
+    mc.max_files = 4;
+    sdmmc_card_t *card = nullptr;
+    esp_err_t err = esp_vfs_fat_sdspi_mount("/sdcard", &host, &slot, &mc, &card);
+    if (err == ESP_OK) {
+        sd_mounted = true;
+        Serial.printf("[sd] mounted /sdcard (%s, %02x:%02x)\n", card->cid.name,
+                      (unsigned)card->csd.capacity >> 16, 0u);
+    } else {
+        Serial.printf("[sd] mount failed: %s (no card inserted?)\n", esp_err_to_name(err));
+    }
+}
+
+static void scan_sd(void) {
+    n_sd = 0;
+    if (!sd_mounted) return;
+    DIR *d = opendir("/sdcard");
+    if (!d) return;
+    struct dirent *e;
+    while ((e = readdir(d)) && n_sd < 16) {
+        const char *n = e->d_name;
+        size_t len = strlen(n);
+        bool ok = len > 4 && len < 23 &&
+            (!strcasecmp(n + len - 3, ".xm") || !strcasecmp(n + len - 3, ".s3m") ||
+             !strcasecmp(n + len - 3, ".mod"));
+        if (!ok) continue;
+        snprintf(sd_names[n_sd], sizeof(sd_names[0]), "%s", n);
+        snprintf(sd_paths[n_sd], sizeof(sd_paths[0]), "/sdcard/%s", n);
+        n_sd++;
+    }
+    closedir(d);
+    Serial.printf("[sd] %d track file(s)\n", n_sd);
+}
+
+// Load a module file from the SD card into PSRAM and play it.
+static bool load_sd_track(const char *path) {
+    FILE *fp = fopen(path, "rb");
+    if (!fp) { Serial.printf("[sd] open failed: %s\n", path); return false; }
+    fseek(fp, 0, SEEK_END);
+    long sz = ftell(fp);
+    fseek(fp, 0, SEEK_SET);
+    if (sz <= 0 || sz > 1024*1024) { fclose(fp); Serial.println("[sd] bad size"); return false; }
+    uint8_t *buf = (uint8_t*)heap_caps_malloc(sz, MALLOC_CAP_SPIRAM);
+    if (!buf) { fclose(fp); Serial.println("[sd] OOM"); return false; }
+    size_t rd = fread(buf, 1, sz, fp);
+    fclose(fp);
+    if (rd != (size_t)sz) { free(buf); Serial.println("[sd] short read"); return false; }
+    // old buffer is freed by teardown
+    teardown_audio();
+    g_player = openArray(buf, (uint32_t)sz, SAMPLE_RATE, 1);
+    g_sdbuf = buf; g_sdlen = sz;   // kept for the player's lifetime, freed at next teardown
+    if (!g_player) { Serial.println("[sd] parse failed"); return false; }
+    if (!start_pipeline()) return false;
+    Serial.printf("[sd] playing %s (%ld bytes)\n", path, sz);
+    return true;
+}
+
+// ================= reusable menu object =================
+// A menu is a table of MenuItems. Types:
+//   MI_ACTION  — running a command (R fires it)
+//   MI_VALUE   — get()/adjust(±1) pair; L/R changes the value, shown after the label
+//   MI_SUBMENU — pushes another Menu (R enters, L goes back)
+//   MI_INSTLIST / MI_TRACKLIST — dynamic lists rendered with list_count/list_label
+enum MIType : uint8_t { MI_ACTION, MI_VALUE, MI_SUBMENU, MI_INSTLIST, MI_TRACKLIST };
+struct MenuItem;
+struct Menu;
+struct MenuItem {
+    const char *label;
+    MIType      type;
+    int         (*get)(void);      // MI_VALUE: current value
+    const char **vals;             // MI_VALUE: optional value names
+    int         nvals;
+    void        (*adjust)(int d);  // MI_VALUE: d = +1 / -1
+    const Menu *sub;               // MI_SUBMENU
+    void        (*act)(void);      // MI_ACTION
+};
+struct Menu { const char *title; const MenuItem *items; int n; };
+
+static bool        menu_open = false;
+static int         menu_sel  = 0;
+static const Menu *menu_cur  = nullptr;
+static const Menu *menu_stack[4];
+static int         menu_sp   = 0;
+
+static void menu_close(void) {
+    menu_open = false; menu_cur = nullptr; menu_sp = 0;
+    if (dpad_v != 0) { apply_voicing(0); dpad_v = 0; }   // clean base triad on return
+    Serial.println("[menu] closed"); Serial.flush();
+}
+static void menu_open_at(const struct Menu *m) {
+    if (!menu_open) { menu_open = true; menu_sp = 0; }
+    else if (menu_sp < 4 && menu_cur) menu_stack[menu_sp++] = menu_cur;
+    menu_cur = m; menu_sel = 0;
+    Serial.printf("[menu] %s\n", m->title); Serial.flush();
+}
+static void menu_back(void) {
+    if (menu_sp > 0) { menu_cur = menu_stack[--menu_sp]; menu_sel = 0; }
+    else menu_close();
+}
+
+// ---- value hooks (root / octave / voicing / single-note) ----
+static int get_root(void) { return key_root; }
+static void adj_root(int d) {
+    key_root = (key_root + (d > 0 ? 1 : 11)) % 12;
+    Serial.printf("[menu] root=%s\n", NOTE_NAMES[key_root]);
+    for (int k = 0; k < 7; k++) if (key_held[k]) refresh_held();
+}
+static int get_oct(void) { return octave + 2; }
+static void adj_oct(int d) {
+    octave += (d > 0 ? 1 : -1);
+    if (octave > 2) octave = -2;
+    if (octave < -2) octave = 2;
+    Serial.printf("[menu] octave=%+d\n", octave);
+    for (int k = 0; k < 7; k++) if (key_held[k]) refresh_held();
+}
+static int get_voic(void) { return active_voicing; }
+static void adj_voic(int d) {
+    int v = (active_voicing + (d > 0 ? 1 : 8)) % 9;
+    apply_voicing(v); dpad_v = v;
+    Serial.printf("[menu] voicing=%s\n", VOICE_NAMES[v]);
+}
+static int get_sn(void) { return single_note ? 1 : 0; }
+static void adj_sn(int d) {
+    single_note = !single_note;
+    Serial.printf("[menu] single_note %s\n", single_note ? "on" : "off");
+    for (int k = 0; k < 7; k++) if (key_held[k]) refresh_held();
+}
+
+static const char *VOIC_VALS[9] = { VOICE_NAMES[0], VOICE_NAMES[1], VOICE_NAMES[2], VOICE_NAMES[3],
+    VOICE_NAMES[4], VOICE_NAMES[5], VOICE_NAMES[6], VOICE_NAMES[7], VOICE_NAMES[8] };
+static const char *SN_VALS[2]   = { "off", "on" };
+
+// ---- instrument list hooks ----
+static int inst_count(void) { return g_player ? g_player->module->num_playable : 0; }
+static int inst_number(int idx) {   // 0-based playable index -> 1-based instrument number
+    if (!g_player) return 1;
+    int c = -1;
+    for (int ins = 1; ins <= g_player->module->num_instruments; ins++) {
+        if (g_player->module->instruments[ins].num_samples > 0) { if (++c == idx) return ins; }
+    }
+    return 1;
+}
+static int get_curi(void) {         // where does cur_inst sit in the playable list?
+    if (!g_player) return 0;
+    for (int i = 0; i < inst_count(); i++) if (inst_number(i) == cur_inst) return i;
+    return 0;
+}
+
+// ---- track list hooks (2 flash partitions + SD files) ----
+static int track_count(void) { return 2 + n_sd; }
+static void track_label(int i, char *buf, int bl) {
+    if (i < 2) snprintf(buf, bl, "%s", TRACK_NAMES[i]);
+    else       snprintf(buf, bl, "%s", sd_names[i - 2]);
+}
+static void track_select(int i) {
+    if (i < 2) {
+        if (g_track != i) { g_track = i; load_track(); }
+        Serial.printf("[menu] track %d: %s\n", g_track + 1, TRACK_NAMES[g_track]);
+    } else {
+        load_sd_track(sd_paths[i - 2]);
+    }
+    Serial.flush();
+}
+
+// ---- menu tables (dynamic menus get nullptr items; lists come from hooks) ----
+static const Menu MENU_INST  = { "INSTRUMENT", nullptr, 0 };  // dynamic (MI_INSTLIST)
+static const Menu MENU_TRACK = { "LOAD TRACK", nullptr, 0 };  // dynamic (MI_TRACKLIST)
+
+static const MenuItem ITEMS_SOUND[] = {
+    { "Single Note", MI_VALUE, get_sn,   SN_VALS,   2, adj_sn,   nullptr, nullptr },
+    { "Back",        MI_ACTION, nullptr, nullptr, 0, nullptr, nullptr, [](){ menu_back(); } },
+};
+static const Menu MENU_SOUND = { "SOUND", ITEMS_SOUND, 2 };
+
+static const MenuItem ITEMS_ROOT[] = {
+    { "Instrument", MI_SUBMENU,  nullptr, nullptr, 0, nullptr, &MENU_INST, nullptr },
+    { "Sound",      MI_SUBMENU,  nullptr, nullptr, 0, nullptr, &MENU_SOUND, nullptr },
+    { "Root",       MI_VALUE,    get_root, NOTE_NAMES, 12, adj_root, nullptr, nullptr },
+    { "Octave",     MI_VALUE,    get_oct,  nullptr, 0, adj_oct, nullptr, nullptr },
+    { "Load Track", MI_SUBMENU,  nullptr, nullptr, 0, nullptr, &MENU_TRACK, nullptr },
+    { "Close",      MI_ACTION,   nullptr, nullptr, 0, nullptr, nullptr, [](){ menu_close(); } },
+};
+static const Menu MENU_ROOT = { "IBMXCHORD MENU", ITEMS_ROOT, 6 };
+
+// ---- menu input: U/D cursor, L/R value-or-nav, U+D/L+R quick access ----
+static void menu_nav(bool up, bool rt, bool dn, bool lf) {
+    static bool u_was=false, d_was=false, r_was=false, l_was=false, q_ud=false, q_lr=false;
+    bool is_list = (menu_cur->items == nullptr) ||
+                   (menu_cur->items[menu_sel].type == MI_INSTLIST) ||
+                   (menu_cur->items[menu_sel].type == MI_TRACKLIST);
+
+    if (is_list) {
+        int n = (menu_cur == &MENU_INST) ? inst_count() : track_count();
+        if (n > 0) {
+                if (up && !dn && !u_was) menu_sel = (menu_sel + n - 1) % n;
+            if (dn && !up && !d_was) menu_sel = (menu_sel + 1) % n;
+            if (lf && !l_was) menu_back();   // L = back in these list submenus
+            if (rt && !r_was) {
+                if (menu_cur == &MENU_INST) {
+                    cur_inst = inst_number(menu_sel);
+                    char nm[32]; ibxm_instrument_name(g_player, cur_inst, nm, sizeof(nm));
+                    Serial.printf("[menu] inst %d: %s\n", cur_inst, nm);
+                } else {
+                    track_select(menu_sel);
+                }
+            }
+        }
+    } else {
+        const MenuItem &it = menu_cur->items[menu_sel];
+        int n = menu_cur->n;
+        if (up && !dn && !u_was) menu_sel = (menu_sel + n - 1) % n;
+        if (dn && !up && !d_was) menu_sel = (menu_sel + 1) % n;
+        if (rt && !r_was) {
+            switch (it.type) {
+                case MI_VALUE:   if (it.adjust) it.adjust(+1); break;
+                case MI_SUBMENU: menu_open_at(it.sub); break;
+                case MI_ACTION:  if (it.act) it.act(); break;
+                default: break;
+            }
+        }
+        if (lf && !l_was) {
+            if (it.type == MI_VALUE) { if (it.adjust) it.adjust(-1); }
+            else menu_back();
+        }
+    }
+    // quick access (works from anywhere in the menu)
+    if (up && dn && !q_ud) menu_open_at(&MENU_INST);
+    if (lf && rt && !q_lr) menu_open_at(&MENU_SOUND);
+    q_ud = up && dn; q_lr = lf && rt;
+    u_was = up && !dn; d_was = dn && !up; r_was = rt && !lf; l_was = lf && !rt;
+}
+
 static void scan_buttons() {
-    // edge-latch state (declared once, reused by every menu/state block below)
+    // edge-latch state (declared once, reused by every state block below)
     static int  inst_was = 1;
-    static uint32_t inst_press_t = 0;
-    static bool lr_was    = false;   // L+R together -> toggle chord_menu
-    static bool ud_was    = false;   // U+D together -> toggle track menu
-    static bool m_l_was=false, m_r_was=false, m_u_was=false, m_d_was=false; // track-menu edges
-    static bool c_u_was=false, c_d_was=false, c_l_was=false;                 // chord-menu edges
+    static bool ud_was = false, lr_was = false;
+
+    // ---- 7 chord keys: always active, never close the menu ----
     for (int k = 0; k < 7; k++) {
         bool down = digitalRead(KEY_PINS[k]) == LOW;
-        if (down && !key_held[k]) {
-            if (menu_mode || chord_menu) { menu_mode=false; chord_menu=false; reset_to_ibmxchord(); Serial.printf("[menu] exit\n"); Serial.flush(); }
-            trigger_chord(k);
-        }
+        if (down && !key_held[k]) trigger_chord(k);
         else if (!down && key_held[k]) release_chord(k);
     }
-    // instrument select on GPIO0: a LOW edge (press) = next instrument.
-    // inst_was tracks the PREVIOUS level so we fire once per press, not per scan.
+
+    // ---- instrument button = menu toggle ----
     int ilevel = digitalRead(INST_PIN);
     if (ilevel != inst_was) {
-        Serial.printf("[gpio18 raw=%d]\n", ilevel); Serial.flush();
-        if (ilevel == LOW) inst_press_t = millis();
-        else {
-            if (menu_mode || chord_menu) { menu_mode=false; chord_menu=false; reset_to_ibmxchord(); Serial.printf("[menu] exit\n"); Serial.flush(); }
-            struct module *m = g_player->module;
-            if (millis() - inst_press_t < 600) {
-                // step to the next instrument that actually has a decoded wave
-                cur_inst = ibxm_next_instrument(g_player, cur_inst);
-                char iname[32];
-                ibxm_instrument_name(g_player, cur_inst, iname, sizeof(iname));
-                Serial.printf("[instrument %d] %s\n", cur_inst, iname);
-            } else {
-                octave = (octave < 2) ? octave + 1 : -2;
-                Serial.printf("[octave %+d]\n", octave);
-            }
-            for (int k = 0; k < 7; k++) if (key_held[k]) refresh_held();
-            Serial.flush();
+        if (ilevel == LOW) {
+            if (!menu_open) menu_open_at(&MENU_ROOT);
+            else menu_close();
         }
         inst_was = ilevel;
     }
 
-    // Ibmxchord joystick = 8 directions. D-pad is 4-way, so we read the X/Y axes
-    // orthogonally and synthesize diagonals from held pairs (U+L=Up-Left, etc).
-    // dir map (0..8): 0=none,1=Up,2=Right,3=Down,4=Left,5=Up-Left,6=Up-Right,
-    //                 7=Down-Right,8=Down-Left
+    // ---- D-pad ----
     bool up = digitalRead(DPAD_PINS[2]) == LOW;
     bool rt = digitalRead(DPAD_PINS[1]) == LOW;
     bool dn = digitalRead(DPAD_PINS[3]) == LOW;
     bool lf = digitalRead(DPAD_PINS[0]) == LOW;
 
-    // L+R held together = toggle the chord-menu (root note / single-note settings).
-    if (lf && rt) {
-        if (!lr_was) {
-            chord_menu = !chord_menu;
-            if (chord_menu) Serial.printf("[cmenu] U/D=root  L=single-note (key/inst exits)\n");
-            else           Serial.printf("[cmenu] exit\n");
-            Serial.flush();
-            lr_was = true;
-        }
-        return;   // don't also fire a diagonal voicing on this scan
-    }
-    lr_was = false;   // released (or not held): re-arm the toggle for next press
-    // U+D held together = toggle the "listen to original track" menu.
-    if (up && dn) {
-        if (!ud_was) {
-            menu_mode = !menu_mode;
-            if (menu_mode) Serial.printf("[menu] L=stop  R=play  U/D=track  (key/inst exits)\n");
-            else           Serial.printf("[menu] exit\n");
-            Serial.flush();
-            ud_was = true;
-        }
-        return;   // hold U+D: stay put, don't run voicings
-    }
-    ud_was = false;
-    if (menu_mode) {
-        // edge-triggered actions: one per press of L / R / U / D
-        bool mL = lf, mR = rt, mU = up && !dn, mD = dn && !up;
-        if (mL && !m_l_was) {
-            ibxm_sequence_stop(g_player);
-            cur_inst = 1;   // reset to the first instrument on stop
-            Serial.printf("[menu] stopped\n"); Serial.flush();
-        } else if (mR && !m_r_was) {
-            ibxm_sequence_play(g_player);   // unmute + restart from top
-            Serial.printf("[menu] playing original\n"); Serial.flush();
-        } else if (mU && !m_u_was) {
-            g_track = (g_track + 1) % 2;
-            if (load_track()) { Serial.printf("[menu] track %d: %s\n", g_track+1, TRACK_NAMES[g_track]); Serial.flush(); }
-        } else if (mD && !m_d_was) {
-            g_track = (g_track + 1) % 2;
-            if (load_track()) { Serial.printf("[menu] track %d: %s\n", g_track+1, TRACK_NAMES[g_track]); Serial.flush(); }
-        }
-        m_l_was=mL; m_r_was=mR; m_u_was=mU; m_d_was=mD;
-        return;
-    }
-    if (chord_menu) {
-        // edge-triggered: U/D = change root note, L = toggle single-note mode
-        bool cU = up && !dn, cD = dn && !up, cL = lf && !rt;
-        if (cU && !c_u_was) {
-            key_root = (key_root + 1) % 12;
-            Serial.printf("[cmenu] root=%s\n", NOTE_NAMES[key_root]); Serial.flush();
-            for (int k=0;k<7;k++) if (key_held[k]) refresh_held();
-        } else if (cD && !c_d_was) {
-            key_root = (key_root + 11) % 12;
-            Serial.printf("[cmenu] root=%s\n", NOTE_NAMES[key_root]); Serial.flush();
-            for (int k=0;k<7;k++) if (key_held[k]) refresh_held();
-        } else if (cL && !c_l_was) {
-            single_note = !single_note;
-            Serial.printf("[cmenu] single_note %s\n", single_note ? "on" : "off"); Serial.flush();
-            for (int k=0;k<7;k++) if (key_held[k]) refresh_held();
-        }
-        c_u_was=cU; c_d_was=cD; c_l_was=cL;
+    if (menu_open) {
+        menu_nav(up, rt, dn, lf);
         return;
     }
 
+    // closed-state quick access: U+D -> instruments, L+R -> sounding options
+    if (up && dn) {
+        if (!ud_was) { menu_open_at(&MENU_INST); ud_was = true; }
+        return;
+    }
+    ud_was = false;
+    if (lf && rt) {
+        if (!lr_was) { menu_open_at(&MENU_SOUND); lr_was = true; }
+        return;
+    }
+    lr_was = false;
+
+    // ---- voicing (8 directions via diagonal synthesis) ----
     int v = 0;
     if (up && !rt && !dn && !lf) v = 1;
     else if (!up && rt && !dn && !lf) v = 2;
@@ -606,7 +799,6 @@ void drawGrid() {
 
 
 // ---- ST7789 240x240 display (reused ESP_TFT + tile + bigfont) ----
-static bool display_ready = false;
 static void display_init() {
     display_ready = tft_init(LCD_TYPE_ST7789, DIS_TILE_WIDTH, DIS_TILE_HEIGHT);
     if (!display_ready) {
@@ -626,6 +818,58 @@ static void display_init() {
     Serial.println("[display] ESP_TFT ready");
 }
 
+// Transparent-text palette helper: TRANSPARENT_TILE (0x20) makes glyph
+// background pixels (b==0) keep the layer below.
+#define TXT_PAL(p) ((p) | TRANSPARENT_TILE)
+
+// Render the active menu onto the main tile layer (over the BG grid).
+static void draw_menu() {
+    if (!display_ready || !menu_open || !menu_cur) return;
+    tft_tile_clear();
+    tft_lilfont_printf(1, 1, TXT_PAL(0), "%s", menu_cur->title);
+
+    bool is_list = (menu_cur->items == nullptr) ||
+                   (menu_cur->items[menu_sel].type == MI_INSTLIST) ||
+                   (menu_cur->items[menu_sel].type == MI_TRACKLIST);
+    int n = is_list ? ((menu_cur == &MENU_INST) ? inst_count() : track_count())
+                    : menu_cur->n;
+    char line[40];
+    const int VIS = 12;                       // items visible below the title
+    int base = (menu_sel > VIS - 1) ? menu_sel - (VIS - 1) : 0;
+    for (int row = 0; row < VIS && (base + row) < n; row++) {
+        int idx = base + row;
+        uint8_t y = 3 + row * 2;
+        const char *cursor = (idx == menu_sel) ? "-" : " ";   // font has no '>' glyph
+        if (is_list) {
+            uint8_t rp = (idx == menu_sel) ? 1 : 0;   // highlight the selected row
+            if (menu_cur == &MENU_INST) {
+                int ins = inst_number(idx);
+                char nm[28]; nm[0] = 0;
+                if (g_player) ibxm_instrument_name(g_player, ins, nm, sizeof(nm));
+                tft_lilfont_printf(1, y, TXT_PAL(rp), "%s%2d %s", cursor, ins, nm);
+            } else {
+                char lbl[24]; track_label(idx, lbl, sizeof(lbl));
+                tft_lilfont_printf(1, y, TXT_PAL(rp), "%s%s", cursor, lbl);
+            }
+        } else {
+            const MenuItem &it = menu_cur->items[idx];
+            if (it.type == MI_VALUE && it.get) {
+                int v = it.get();
+                const char *vs = (it.vals && v >= 0 && v < it.nvals) ? it.vals[v] : nullptr;
+                if (vs) snprintf(line, sizeof(line), "%s%s: %s", cursor, it.label, vs);
+                else    snprintf(line, sizeof(line), "%s%s: %+d", cursor, it.label, v - (it.get == get_oct ? 2 : 0));
+            } else {
+                snprintf(line, sizeof(line), "%s%s", cursor, it.label);
+            }
+            tft_lilfont_printf(1, y, TXT_PAL(idx == menu_sel ? 1 : 0), "%s", line);
+        }
+    }
+
+    // Push the composed menu frame to the panel (same as the status page).
+    for (uint8_t y = 0; y < 30; y++) tft_tile_render(y, 0, 0);
+    tft_tile_sendLine(29*8, 0);
+}
+
 // Mirror live state to the screen via the tile engine. Throttled ~8 fps.
 // Tile coords are 8px; tft_lilfont_printf(x,y,pal,fmt...) writes at tile(x,y).
 static uint32_t ui_t0 = 0;
@@ -634,12 +878,9 @@ static void draw_ui() {
     if (millis() - ui_t0 < 120) return;   // ~8 fps refresh
     ui_t0 = millis();
 
-    tft_tile_clear();   // clears the MAIN map only — BG grid (drawGrid) persists
+    if (menu_open) { draw_menu(); return; }   // menu replaces the status page
 
-    // Text sits one tile (8px) in from the corner and is transparent so the
-    // background grid shows through. TRANSPARENT_TILE (0x20) makes glyph
-    // background pixels (b==0) keep the layer below.
-    #define TXT_PAL(p) ((p) | TRANSPARENT_TILE)
+    tft_tile_clear();   // clears the MAIN map only — BG grid (drawGrid) persists
 
     // Title / track (palette 1 = light-on-blue)
     tft_lilfont_printf(1, 1, TXT_PAL(0), "Ibmxchord  %s", TRACK_NAMES[g_track]);
@@ -656,14 +897,7 @@ static void draw_ui() {
     tft_lilfont_printf(1, 16, TXT_PAL(0), "voic %s", VOICE_NAMES[active_voicing]);
 
     // Mode line
-    if (single_note)
-        tft_lilfont_printf(1, 19, TXT_PAL(0), "SINGLE-NOTE");
-    else if (chord_menu)
-        tft_lilfont_printf(1, 19, TXT_PAL(0), "CHORD MENU");
-    else if (menu_mode)
-        tft_lilfont_printf(1, 19, TXT_PAL(0), "TRACK PLAY");
-    else
-        tft_lilfont_printf(1, 19, TXT_PAL(0), "CHORD MODE");
+    tft_lilfont_printf(1, 19, TXT_PAL(0), single_note ? "SINGLE-NOTE" : "CHORD MODE");
 
     // Held keys as a row of 7 markers (I ii iii IV V vi vii) — highlight when held.
     const char *DEG[7] = {"I","ii","iii","IV","V","vi","vii"};
@@ -711,6 +945,8 @@ void setup() {
     if (!psramFound()) Serial.println("WARN: no PSRAM");
 
     display_init();
+    mount_sd();
+    scan_sd();
 
     if (!init_i2s()) { Serial.println("i2s init failed"); while (1) delay(1000); }
     g_ring = ibxm_ring_create(RING_FRAMES, SAMPLE_RATE);

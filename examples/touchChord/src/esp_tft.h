@@ -24,7 +24,7 @@
     // 19/20/22 are NOT broken out on this board, so they are avoided.
     // CS is optional for a single-device SPI bus — GPIO16 drives it when wired.
     // 14/15/17 = MOSI/SCLK/DC outputs, 21 = RST output. All bidirectional.
-    #define PIN_NUM_MISO    -1   // display is write-only; no MISO line
+    #define PIN_NUM_MISO    12   // shared with SD card DO (display never drives it)
     #define PIN_NUM_MOSI    14   // SDA (data out)
     #define PIN_NUM_CLK     15   // SCL (clock)
     #define PIN_NUM_CS      16   // chip select (GPIO16, bidirectional)
