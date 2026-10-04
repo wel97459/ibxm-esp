@@ -258,6 +258,16 @@ static int alloc_chord_voice(void) {
     return -1;
 }
 
+// ---- drum mode state ----
+// Each of the 7 buttons plays its assigned instrument as a single hit
+// (no chord intervals). Tuning is in semitones; 0 = middle C.
+#define DRUM_BASE_NOTE 60   // ibxm key for middle C
+static bool   drum_mode = false;
+static int8_t drum_inst[7] = {0, 1, 2, 3, 4, 5, 6};   // playable-list index per button
+static int8_t drum_tune[7] = {0, 0, 0, 0, 0, 0, 0};   // semitones from middle C
+static void drum_retrig(int idx);
+static int  inst_number(int idx);
+
 // (Re)trigger the shared chord with the current anchor/root/voicing.
 // Only (re)issues ibxm_note_on for voices whose note actually changed or that are
 // newly allocated — a sustained re-commit (e.g. on a release) must NOT re-attack
@@ -284,6 +294,25 @@ static void trigger_chord_now(void) {
 }
 
 static void trigger_chord(int deg) {
+    if (drum_mode) {
+        // Drum mode: each button is a single hit of its assigned instrument,
+        // tuned from middle C. One voice per button (key_voice[]).
+        int note = DRUM_BASE_NOTE + drum_tune[deg];
+        if (note > 96) note = 96;
+        if (note < 1) note = 1;
+        int ins = inst_number(drum_inst[deg]);
+        int ch = alloc_chord_voice();
+        key_voice[deg] = ch;
+        if (ch >= 0) {
+            ibxm_note_on(g_player, ch, note, ins, 0x40);
+            Serial.printf("[drum %d] inst=%d note=%d ch=%d\n", deg + 1, ins, note, ch);
+        } else {
+            Serial.printf("[drum %d] no free voice\n", deg + 1);
+        }
+        Serial.flush();
+        key_held[deg] = true;
+        return;
+    }
     if (single_note) {
         // Each key gets its OWN voice (tracked in key_voice[]) so it releases
         // independently. No chord_mode shared voices involved.
@@ -318,6 +347,12 @@ static void trigger_chord(int deg) {
 }
 
 static void release_chord(int deg) {
+    if (drum_mode) {
+        int ch = key_voice[deg];
+        if (ch >= 0) { ibxm_note_off(g_player, ch); key_voice[deg] = -1; }
+        key_held[deg] = false;
+        return;
+    }
     Serial.printf("[key %d up]\n", deg + 1); Serial.flush();
     if (single_note) {
         int ch = key_voice[deg];
@@ -529,12 +564,14 @@ struct Menu;
 struct MenuItem {
     const char *label;
     MIType      type;
-    int         (*get)(void);      // MI_VALUE: current value
-    const char **vals;             // MI_VALUE: optional value names
+    int         (*get)(int idx);        // MI_VALUE: current value (idx = item context, e.g. drum button)
+    const char **vals;                 // MI_VALUE: optional value names
     int         nvals;
-    void        (*adjust)(int d);  // MI_VALUE: d = +1 / -1
+    void        (*adjust)(int idx, int d);  // MI_VALUE: d = +1 / -1
     const Menu *sub;               // MI_SUBMENU
     void        (*act)(void);      // MI_ACTION
+    int         idx;               // context passed to get/adjust (0 for plain items)
+    void        (*fmt)(int idx, int v, char *buf, int bl);  // optional custom value text
 };
 struct Menu { const char *title; const MenuItem *items; int n; };
 
@@ -561,14 +598,14 @@ static void menu_back(void) {
 }
 
 // ---- value hooks (root / octave / voicing / single-note) ----
-static int get_root(void) { return key_root; }
-static void adj_root(int d) {
+static int get_root(int) { return key_root; }
+static void adj_root(int, int d) {
     key_root = (key_root + (d > 0 ? 1 : 11)) % 12;
     Serial.printf("[menu] root=%s\n", NOTE_NAMES[key_root]);
     for (int k = 0; k < 7; k++) if (key_held[k]) refresh_held();
 }
-static int get_oct(void) { return octave + 2; }
-static void adj_oct(int d) {
+static int get_oct(int) { return octave + 2; }
+static void adj_oct(int, int d) {
     octave += (d > 0 ? 1 : -1);
     if (octave > 2) octave = -2;
     if (octave < -2) octave = 2;
@@ -581,8 +618,8 @@ static void adj_voic(int d) {
     apply_voicing(v); dpad_v = v;
     Serial.printf("[menu] voicing=%s\n", VOICE_NAMES[v]);
 }
-static int get_sn(void) { return single_note ? 1 : 0; }
-static void adj_sn(int d) {
+static int get_sn(int) { return single_note ? 1 : 0; }
+static void adj_sn(int, int d) {
     single_note = !single_note;
     Serial.printf("[menu] single_note %s\n", single_note ? "on" : "off");
     for (int k = 0; k < 7; k++) if (key_held[k]) refresh_held();
@@ -621,18 +658,66 @@ static void track_select(int i) {
     } else {
         load_sd_track(sd_paths[i - 2]);
     }
-    Serial.flush();
 }
 
-// ---- menu tables (dynamic menus get nullptr items; lists come from hooks) ----
-static const Menu MENU_INST  = { "INSTRUMENT", nullptr, 0 };  // dynamic (MI_INSTLIST)
-static const Menu MENU_TRACK = { "LOAD TRACK", nullptr, 0 };  // dynamic (MI_TRACKLIST)
+// ---- drum mode hooks ----
+static const char *DRUM_VALS[2] = { "off", "on" };
+static int get_drummode(int) { return drum_mode ? 1 : 0; }
+static void adj_drummode(int, int d) {
+    drum_mode = d > 0;
+    Serial.printf("[menu] drum_mode %s\n", drum_mode ? "on" : "off");
+    reset_to_ibmxchord();   // silence everything; clean slate for the new mode
+    Serial.flush();
+}
+static int get_druminst(int idx) { return drum_inst[idx]; }
+static void adj_druminst(int idx, int d) {
+    int n = inst_count();
+    if (n <= 0) return;
+    drum_inst[idx] = (drum_inst[idx] + (d > 0 ? 1 : n - 1)) % n;
+    drum_retrig(idx);
+}
+static void fmt_druminst(int idx, int v, char *buf, int bl) {
+    int ins = inst_number(v);
+    char nm[20]; nm[0] = 0;
+    if (g_player) ibxm_instrument_name(g_player, ins, nm, sizeof(nm));
+    snprintf(buf, bl, "%2d %s", ins, nm);
+}
+static int get_drumtune(int idx) { return drum_tune[idx] + 12; }   // 0..24, 12 = middle C
+static void adj_drumtune(int idx, int d) {
+    drum_tune[idx] += (d > 0 ? 1 : -1);
+    if (drum_tune[idx] > 12) drum_tune[idx] = 12;
+    if (drum_tune[idx] < -12) drum_tune[idx] = -12;
+    drum_retrig(idx);
+}
+static void fmt_drumtune(int idx, int v, char *buf, int bl) {
+    int t = v - 12;
+    if (t == 0) snprintf(buf, bl, "C4 (middle C)");
+    else snprintf(buf, bl, "C4 %+d st", t);
+}
+// re-trigger a held drum button so edits are heard live
+static void drum_retrig(int idx) {
+    if (!drum_mode || !key_held[idx] || !g_player) return;
+    int ch = key_voice[idx];
+    if (ch >= 0) ibxm_note_off(g_player, ch);
+    int note = DRUM_BASE_NOTE + drum_tune[idx];
+    if (note > 96) note = 96;
+    if (note < 1) note = 1;
+    int ins = inst_number(drum_inst[idx]);
+    ibxm_note_on(g_player, ch, note, ins, 0x40);
+}
+
+extern const Menu MENU_DRUMS;   // defined below (referenced by the Sound submenu)
 
 static const MenuItem ITEMS_SOUND[] = {
-    { "Single Note", MI_VALUE, get_sn,   SN_VALS,   2, adj_sn,   nullptr, nullptr },
-    { "Back",        MI_ACTION, nullptr, nullptr, 0, nullptr, nullptr, [](){ menu_back(); } },
+    { "Single Note", MI_VALUE, get_sn,   SN_VALS,   2, adj_sn,   nullptr, nullptr, 0, nullptr },
+    { "Drum Mode",   MI_VALUE, get_drummode, DRUM_VALS, 2, adj_drummode, nullptr, nullptr, 0, nullptr },
+    { "Drums",       MI_SUBMENU, nullptr, nullptr, 0, nullptr, &MENU_DRUMS, nullptr, 0, nullptr },
+    { "Back",        MI_ACTION, nullptr, nullptr, 0, nullptr, nullptr, [](){ menu_back(); }, 0, nullptr },
 };
-static const Menu MENU_SOUND = { "SOUND", ITEMS_SOUND, 2 };
+static const Menu MENU_SOUND = { "SOUND", ITEMS_SOUND, 4 };
+
+static const Menu MENU_INST  = { "INSTRUMENT", nullptr, 0 };  // dynamic (MI_INSTLIST)
+static const Menu MENU_TRACK = { "LOAD TRACK", nullptr, 0 };  // dynamic (MI_TRACKLIST)
 
 static const MenuItem ITEMS_ROOT[] = {
     { "Instrument", MI_SUBMENU,  nullptr, nullptr, 0, nullptr, &MENU_INST, nullptr },
@@ -643,6 +728,19 @@ static const MenuItem ITEMS_ROOT[] = {
     { "Close",      MI_ACTION,   nullptr, nullptr, 0, nullptr, nullptr, [](){ menu_close(); } },
 };
 static const Menu MENU_ROOT = { "IBMXCHORD MENU", ITEMS_ROOT, 6 };
+
+MenuItem ITEMS_DRUMS[15];   // 7 x (inst, tune) + Back - built in menu_init()
+const Menu MENU_DRUMS = { "DRUMS", ITEMS_DRUMS, 15 };
+
+// Build the per-button drum rows: Btn k = {Inst, Tune}, then a Back row.
+static void menu_init(void) {
+    static const char *BTN[7] = { "Key 1", "Key 2", "Key 3", "Key 4", "Key 5", "Key 6", "Key 7" };
+    for (int k = 0; k < 7; k++) {
+        ITEMS_DRUMS[k*2]   = { BTN[k],           MI_VALUE, get_druminst, nullptr, 0, adj_druminst, nullptr, nullptr, k, fmt_druminst };
+        ITEMS_DRUMS[k*2+1] = { "   tuning",      MI_VALUE, get_drumtune, nullptr, 0, adj_drumtune, nullptr, nullptr, k, fmt_drumtune };
+    }
+    ITEMS_DRUMS[14] = { "Back", MI_ACTION, nullptr, nullptr, 0, nullptr, nullptr, [](){ menu_back(); }, 0, nullptr };
+}
 
 // ---- menu input: U/D cursor, L/R value-or-nav, U+D/L+R quick access ----
 static void menu_nav(bool up, bool rt, bool dn, bool lf) {
@@ -674,14 +772,14 @@ static void menu_nav(bool up, bool rt, bool dn, bool lf) {
         if (dn && !up && !d_was) menu_sel = (menu_sel + 1) % n;
         if (rt && !r_was) {
             switch (it.type) {
-                case MI_VALUE:   if (it.adjust) it.adjust(+1); break;
+                case MI_VALUE:   if (it.adjust) it.adjust(it.idx, +1); break;
                 case MI_SUBMENU: menu_open_at(it.sub); break;
                 case MI_ACTION:  if (it.act) it.act(); break;
                 default: break;
             }
         }
         if (lf && !l_was) {
-            if (it.type == MI_VALUE) { if (it.adjust) it.adjust(-1); }
+            if (it.type == MI_VALUE) { if (it.adjust) it.adjust(it.idx, -1); }
             else menu_back();
         }
     }
@@ -854,10 +952,16 @@ static void draw_menu() {
         } else {
             const MenuItem &it = menu_cur->items[idx];
             if (it.type == MI_VALUE && it.get) {
-                int v = it.get();
-                const char *vs = (it.vals && v >= 0 && v < it.nvals) ? it.vals[v] : nullptr;
-                if (vs) snprintf(line, sizeof(line), "%s%s: %s", cursor, it.label, vs);
-                else    snprintf(line, sizeof(line), "%s%s: %+d", cursor, it.label, v - (it.get == get_oct ? 2 : 0));
+                int v = it.get(it.idx);
+                char vbuf[32];
+                if (it.fmt) {
+                    it.fmt(it.idx, v, vbuf, sizeof(vbuf));   // custom value text (e.g. instrument names)
+                } else {
+                    const char *vs = (it.vals && v >= 0 && v < it.nvals) ? it.vals[v] : nullptr;
+                    if (vs) snprintf(vbuf, sizeof(vbuf), "%s", vs);
+                    else    snprintf(vbuf, sizeof(vbuf), "%+d", v - (it.get == get_oct ? 2 : 0));
+                }
+                snprintf(line, sizeof(line), "%s%s: %s", cursor, it.label, vbuf);
             } else {
                 snprintf(line, sizeof(line), "%s%s", cursor, it.label);
             }
@@ -897,7 +1001,8 @@ static void draw_ui() {
     tft_lilfont_printf(1, 16, TXT_PAL(0), "voic %s", VOICE_NAMES[active_voicing]);
 
     // Mode line
-    tft_lilfont_printf(1, 19, TXT_PAL(0), single_note ? "SINGLE-NOTE" : "CHORD MODE");
+    tft_lilfont_printf(1, 19, TXT_PAL(0),
+                       drum_mode ? "DRUM MODE" : single_note ? "SINGLE-NOTE" : "CHORD MODE");
 
     // Held keys as a row of 7 markers (I ii iii IV V vi vii) — highlight when held.
     const char *DEG[7] = {"I","ii","iii","IV","V","vi","vii"};
@@ -935,6 +1040,7 @@ static void btn_task(void*) {
 }
 
 void setup() {
+    menu_init();
     Serial.begin(115200);
     for (int k = 0; k < 7; k++) { pinMode(KEY_PINS[k], INPUT_PULLUP); key_held[k] = false; }
     for (int d = 0; d < 4; d++) pinMode(DPAD_PINS[d], INPUT_PULLUP);
