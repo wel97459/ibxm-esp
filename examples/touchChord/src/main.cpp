@@ -58,6 +58,7 @@ static void menu_back(void) {
 
 extern const Menu MENU_DRUMS;   // defined below (referenced by the Sound submenu)
 extern const Menu MENU_SONG;    // defined below (referenced by the root menu)
+extern const Menu MENU_FX;      // defined below (referenced by the root menu)
 
 static const char *SN_VALS[2]   = { "off", "on" };
 static const char *DRUM_VALS[2] = { "off", "on" };
@@ -79,9 +80,19 @@ static const MenuItem ITEMS_ROOT[] = {
     { "Octave",     MI_VALUE,    get_oct,  nullptr, 0, adj_oct, nullptr, nullptr },
     { "Load Track", MI_SUBMENU,  nullptr, nullptr, 0, nullptr, &MENU_TRACK, nullptr },
     { "Song",       MI_SUBMENU,  nullptr, nullptr, 0, nullptr, &MENU_SONG, nullptr },
+    { "FX",         MI_SUBMENU,  nullptr, nullptr, 0, nullptr, &MENU_FX, nullptr },
     { "Close",      MI_ACTION,   nullptr, nullptr, 0, nullptr, nullptr, [](){ menu_close(); } },
 };
-static const Menu MENU_ROOT = { "IBMXCHORD MENU", ITEMS_ROOT, 7 };
+static const Menu MENU_ROOT = { "IBMXCHORD MENU", ITEMS_ROOT, 8 };
+
+static const MenuItem ITEMS_FX[] = {
+    { "Reverb",     MI_VALUE, get_fxrev,  nullptr, 0, adj_fxrev,  nullptr, nullptr, 0, nullptr },
+    { "Delay",      MI_VALUE, get_fxdly,  nullptr, 0, adj_fxdly,  nullptr, nullptr, 0, nullptr },
+    { "Delay time", MI_VALUE, get_fxdlyms, nullptr, 0, adj_fxdlyms, nullptr, nullptr, 0, nullptr },
+    { "Volume",     MI_VALUE, get_fxvol,   nullptr, 0, adj_fxvol,   nullptr, nullptr, 0, nullptr },
+    { "Back",       MI_ACTION, nullptr, nullptr, 0, nullptr, nullptr, [](){ menu_back(); }, 0, nullptr },
+};
+const Menu MENU_FX = { "FX", ITEMS_FX, 5 };
 
 static const MenuItem ITEMS_SONG[] = {
     { "Play original", MI_ACTION, nullptr, nullptr, 0, nullptr, nullptr, [](){ song_play(); }, 0, nullptr },

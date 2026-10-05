@@ -63,5 +63,13 @@ int  get_drumtune(int idx);
 void adj_drumtune(int idx, int d);
 void fmt_druminst(int idx, int v, char *buf, int bl);
 void fmt_drumtune(int idx, int v, char *buf, int bl);
+int  get_fxrev(int idx);
+void adj_fxrev(int idx, int d);
+int  get_fxdly(int idx);
+void adj_fxdly(int idx, int d);
+int  get_fxdlyms(int idx);
+void adj_fxdlyms(int idx, int d);
+int  get_fxvol(int idx);
+void adj_fxvol(int idx, int d);
 
 #endif  // HC_AUDIO_H

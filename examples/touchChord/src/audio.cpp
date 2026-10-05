@@ -8,6 +8,7 @@
 #include "ibxm_ring.h"
 #include "audio.h"
 #include "ui.h"
+#include "fx.h"
 #include "esp_tft.h"      // TFT_SPI_HOST (SD shares the display bus)
 
 #include "driver/sdspi_host.h"
@@ -94,6 +95,7 @@ static void i2s_feed_task(void *arg) {
     while (g_running) {
         int got = ibxm_ring_pull(g_ring, out, pull);
         if (got == 0) { vTaskDelay(pdMS_TO_TICKS(1)); continue; }
+        fx_process(out, got);   // final-output FX (reverb + delay)
         size_t written = 0;
         i2s_write(I2S_PORT, out, (size_t)got * 2 * sizeof(int16_t),
                   &written, pdMS_TO_TICKS(I2S_WRITE_MS));
@@ -119,7 +121,9 @@ bool init_i2s() {
     pins.ws_io_num    = HC_WS;
     pins.data_out_num = HC_DATA;
     pins.data_in_num  = I2S_PIN_NO_CHANGE;
-    return i2s_set_pin(I2S_PORT, &pins) == ESP_OK;
+    bool ok = i2s_set_pin(I2S_PORT, &pins) == ESP_OK;
+    if (ok) fx_init(SAMPLE_RATE);
+    return ok;
 }
 
 // ---- module load ----
@@ -691,6 +695,31 @@ void track_select(int i) {
         load_sd_track(sd_paths[e]);
         ui_loading_done();
     }
+}
+
+// ---- FX menu hooks ----
+int get_fxrev(int) { return fx_reverb_amt; }
+void adj_fxrev(int, int d) {
+    fx_reverb_amt = (fx_reverb_amt + (d > 0 ? 1 : 9)) % 10;
+    Serial.printf("[menu] reverb=%d\n", fx_reverb_amt);
+}
+int get_fxdly(int) { return fx_delay_amt; }
+void adj_fxdly(int, int d) {
+    fx_delay_amt = (fx_delay_amt + (d > 0 ? 1 : 9)) % 10;
+    Serial.printf("[menu] delay=%d\n", fx_delay_amt);
+}
+int get_fxdlyms(int) { return fx_delay_ms / 40; }        // 40..400 in 40 ms steps
+void adj_fxdlyms(int, int d) {
+    fx_delay_ms += (d > 0 ? 40 : -40);
+    if (fx_delay_ms > 400) fx_delay_ms = 40;
+    if (fx_delay_ms < 40)  fx_delay_ms = 400;
+    Serial.printf("[menu] delay time=%d ms\n", fx_delay_ms);
+}
+
+int get_fxvol(int) { return fx_volume; }
+void adj_fxvol(int, int d) {
+    fx_volume = (fx_volume + (d > 0 ? 1 : 9)) % 10;
+    Serial.printf("[menu] volume=%d\n", fx_volume);
 }
 
 // ---- menu value hooks ----

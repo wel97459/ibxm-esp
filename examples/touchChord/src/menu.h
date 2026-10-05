@@ -31,6 +31,6 @@ extern bool        menu_open;   // menu system active?
 extern int         menu_sel;    // cursor row
 extern const Menu *menu_cur;    // current menu
 // dynamic list menus (their items arrays are built on the fly)
-extern const Menu  MENU_INST, MENU_TRACK;
+extern const Menu  MENU_INST, MENU_TRACK, MENU_FX;
 
 #endif  // HC_MENU_H
