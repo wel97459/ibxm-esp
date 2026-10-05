@@ -262,6 +262,20 @@ static int alloc_chord_voice(void) {
 // Each of the 7 buttons plays its assigned instrument as a single hit
 // (no chord intervals). Tuning is in semitones; 0 = middle C.
 #define DRUM_BASE_NOTE 60   // ibxm key for middle C
+static bool   song_playing = false;   // original tracker song audible?
+
+static void song_play(void) {
+    if (!g_player) return;
+    ibxm_sequence_play(g_player);   // unmute + restart from the top
+    song_playing = true;
+    Serial.println("[song] playing original");
+}
+static void song_stop(void) {
+    if (g_player) ibxm_sequence_stop(g_player);
+    song_playing = false;
+    Serial.println("[song] stopped");
+}
+
 static bool   drum_mode = false;
 static int8_t drum_inst[7] = {0, 1, 2, 3, 4, 5, 6};   // playable-list index per button
 static int8_t drum_tune[7] = {0, 0, 0, 0, 0, 0, 0};   // semitones from middle C
@@ -445,6 +459,7 @@ static bool start_pipeline(void) {
     g_ring = ibxm_ring_create(RING_FRAMES, SAMPLE_RATE);
     if (!g_ring) { Serial.println("ring alloc failed"); return false; }
     ibxm_sequence_stop(g_player);   // ensure new module starts silent (patterns off)
+    song_playing = false;
     cur_inst = 1;   // reset to the first instrument on every track load
     memset(chan_pool, 0, sizeof(chan_pool));
     memset(key_chans, -1, sizeof(key_chans));
@@ -494,6 +509,29 @@ static void mount_sd(void) {
     sdspi_device_config_t slot = SDSPI_DEVICE_CONFIG_DEFAULT();
     slot.gpio_cs = (gpio_num_t)SD_CS_PIN;
     slot.host_id = (spi_host_device_t)TFT_SPI_HOST;
+
+    // --- diagnostic probe: initialize the card manually for a detailed error ---
+    esp_err_t e = sdspi_host_init();
+    sdspi_dev_handle_t probe = -1;
+    if (e == ESP_OK || e == ESP_ERR_INVALID_STATE)
+        e = sdspi_host_init_device(&slot, &probe);
+    if (e != ESP_OK) {
+        Serial.printf("[sd] device init failed: %s\n", esp_err_to_name(e));
+        return;
+    }
+    host.slot = probe;                          // sdmmc talks through this device
+    sdmmc_card_t probe_card;
+    esp_err_t ci = sdmmc_card_init(&host, &probe_card);
+    sdspi_host_remove_device(probe);
+    if (ci != ESP_OK) {
+        Serial.printf("[sd] CARD INIT FAILED: %s (0x%x) — check wiring/format\n",
+                      esp_err_to_name(ci), ci);
+        return;
+    }
+    Serial.printf("[sd] card detected: %s %uMB\n", probe_card.cid.name,
+                  (unsigned)((uint64_t)probe_card.csd.capacity * probe_card.csd.sector_size >> 20));
+
+    // --- real mount ---
     esp_vfs_fat_sdmmc_mount_config_t mc = {};
     mc.format_if_mount_failed = false;
     mc.max_files = 4;
@@ -501,10 +539,10 @@ static void mount_sd(void) {
     esp_err_t err = esp_vfs_fat_sdspi_mount("/sdcard", &host, &slot, &mc, &card);
     if (err == ESP_OK) {
         sd_mounted = true;
-        Serial.printf("[sd] mounted /sdcard (%s, %02x:%02x)\n", card->cid.name,
-                      (unsigned)card->csd.capacity >> 16, 0u);
+        Serial.printf("[sd] mounted /sdcard (%s)\n", card->cid.name);
     } else {
-        Serial.printf("[sd] mount failed: %s (no card inserted?)\n", esp_err_to_name(err));
+        Serial.printf("[sd] mount failed after card init: %s — card is likely not FAT32\n",
+                      esp_err_to_name(err));
     }
 }
 
@@ -630,7 +668,13 @@ static const char *VOIC_VALS[9] = { VOICE_NAMES[0], VOICE_NAMES[1], VOICE_NAMES[
 static const char *SN_VALS[2]   = { "off", "on" };
 
 // ---- instrument list hooks ----
-static int inst_count(void) { return g_player ? g_player->module->num_playable : 0; }
+static int inst_count(void) {
+    if (!g_player) return 0;
+    int c = 0;
+    for (int ins = 1; ins <= g_player->module->num_instruments; ins++)
+        if (g_player->module->instruments[ins].num_samples > 0) c++;
+    return c;
+}
 static int inst_number(int idx) {   // 0-based playable index -> 1-based instrument number
     if (!g_player) return 1;
     int c = -1;
@@ -707,6 +751,7 @@ static void drum_retrig(int idx) {
 }
 
 extern const Menu MENU_DRUMS;   // defined below (referenced by the Sound submenu)
+extern const Menu MENU_SONG;    // defined below (referenced by the root menu)
 
 static const MenuItem ITEMS_SOUND[] = {
     { "Single Note", MI_VALUE, get_sn,   SN_VALS,   2, adj_sn,   nullptr, nullptr, 0, nullptr },
@@ -725,9 +770,17 @@ static const MenuItem ITEMS_ROOT[] = {
     { "Root",       MI_VALUE,    get_root, NOTE_NAMES, 12, adj_root, nullptr, nullptr },
     { "Octave",     MI_VALUE,    get_oct,  nullptr, 0, adj_oct, nullptr, nullptr },
     { "Load Track", MI_SUBMENU,  nullptr, nullptr, 0, nullptr, &MENU_TRACK, nullptr },
+    { "Song",       MI_SUBMENU,  nullptr, nullptr, 0, nullptr, &MENU_SONG, nullptr },
     { "Close",      MI_ACTION,   nullptr, nullptr, 0, nullptr, nullptr, [](){ menu_close(); } },
 };
-static const Menu MENU_ROOT = { "IBMXCHORD MENU", ITEMS_ROOT, 6 };
+static const Menu MENU_ROOT = { "IBMXCHORD MENU", ITEMS_ROOT, 7 };
+
+static const MenuItem ITEMS_SONG[] = {
+    { "Play original", MI_ACTION, nullptr, nullptr, 0, nullptr, nullptr, [](){ song_play(); }, 0, nullptr },
+    { "Stop",          MI_ACTION, nullptr, nullptr, 0, nullptr, nullptr, [](){ song_stop(); }, 0, nullptr },
+    { "Back",          MI_ACTION, nullptr, nullptr, 0, nullptr, nullptr, [](){ menu_back(); }, 0, nullptr },
+};
+const Menu MENU_SONG = { "SONG", ITEMS_SONG, 3 };
 
 MenuItem ITEMS_DRUMS[15];   // 7 x (inst, tune) + Back - built in menu_init()
 const Menu MENU_DRUMS = { "DRUMS", ITEMS_DRUMS, 15 };
@@ -920,6 +973,30 @@ static void display_init() {
 // background pixels (b==0) keep the layer below.
 #define TXT_PAL(p) ((p) | TRANSPARENT_TILE)
 
+// Song view: which instrument each channel is currently sounding.
+static void draw_song_view() {
+    if (!display_ready || !g_player) return;
+    tft_tile_clear();
+    tft_lilfont_printf(1, 1, TXT_PAL(0), "Song  %s", TRACK_NAMES[g_track]);
+    tft_lilfont_printf(1, 4, TXT_PAL(0), song_playing ? "PLAYING" : "stopped");
+
+    int row = 0;
+    int nch = g_player->module->num_channels;
+    for (int ch = 0; ch < nch && row < 24; ch++) {
+        int ins = ibxm_channel_instrument(g_player, ch);
+        if (!ins) continue;                       // idle channel: skip
+        char nm[22]; nm[0] = 0;
+        ibxm_instrument_name(g_player, ins, nm, sizeof(nm));
+        tft_lilfont_printf(1, 7 + row * 2, TXT_PAL(0), "c%02d %s", ch + 1, nm);
+        row++;
+    }
+    if (row == 0)
+        tft_lilfont_printf(1, 7, TXT_PAL(0), "(no channels active)");
+
+    for (uint8_t y = 0; y < 30; y++) tft_tile_render(y, 0, 0);
+    tft_tile_sendLine(29*8, 0);
+}
+
 // Render the active menu onto the main tile layer (over the BG grid).
 static void draw_menu() {
     if (!display_ready || !menu_open || !menu_cur) return;
@@ -983,6 +1060,7 @@ static void draw_ui() {
     ui_t0 = millis();
 
     if (menu_open) { draw_menu(); return; }   // menu replaces the status page
+    if (song_playing) { draw_song_view(); return; }   // channel view while the song plays
 
     tft_tile_clear();   // clears the MAIN map only — BG grid (drawGrid) persists
 

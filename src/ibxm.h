@@ -160,6 +160,11 @@ struct ibxm_player * play_module_stream(struct data *d, int sample_rate, int int
 struct ibxm_player * openFile(char *filename, int sample_rate, int interpolation);
 struct ibxm_player * openArray(const uint8_t *dataIn, uint32_t len, int sample_rate, int interpolation);
 
+/* Song-playback introspection: which instrument channel `ch` is currently
+ * sounding (1-based instrument number), or 0 if the channel is idle/silent.
+ * Useful for visualizing pattern playback. */
+int ibxm_channel_instrument(struct ibxm_player *player, int channel);
+
 /* ---- Direct instrument trigger API (Ibmxchord mode) ----
    Bypass the file's pattern sequencer: ibxm_sequence_mute() blanks the
    sequencer (patterns still tick for envelopes/effects but inject no notes),

@@ -2551,6 +2551,19 @@ static int instrument_playable( struct module *module, int ins ) {
    Returns `from` unchanged if no *other* playable instrument exists, so a
    caller stepping from `from` can never spin forever. Skips instrument 0
    (the library's reserved empty slot). */
+int ibxm_channel_instrument( struct ibxm_player *player, int channel ) {
+	if( !player || !player->module || !player->replay ) return 0;
+	if( channel < 0 || channel >= player->module->num_channels ) return 0;
+	struct channel *c = &player->replay->channels[ channel ];
+	if( !c->instrument ) return 0;
+	// silent? (key off AND fadeout finished)
+	if( !c->key_on && c->fadeout_vol == 0 ) return 0;
+	for( int i = 1; i <= player->module->num_instruments; i++ ) {
+		if( c->instrument == &player->module->instruments[ i ] ) return i;
+	}
+	return 0;
+}
+
 int ibxm_next_instrument( struct ibxm_player *player, int from ) {
 	int i, n, total;
 	if( !player || !player->module ) return 0;
