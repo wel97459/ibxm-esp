@@ -40,7 +40,9 @@ int  inst_count();
 int  inst_number(int idx);                // playable index -> 1-based instrument number
 int  track_count();
 void track_label(int i, char *buf, int bl);
+void track_info(int i, char *buf, int bl);   // right-column: "D" or size
 void track_select(int i);
+bool track_back(void);              // L: up one folder in LOAD TRACK
 
 // ---- SD card ----
 void mount_sd();

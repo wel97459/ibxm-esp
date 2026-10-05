@@ -57,6 +57,20 @@ void display_init() {
     Serial.println("[display] ESP_TFT ready");
 }
 
+// "LOADING" dialog. NOT drawn here — track loading runs in btn_task and
+// drawing from two tasks races in the tile buffers/SPI driver. ui_loading()
+// only records the name; draw_ui() renders the dialog on its next pass and
+// keeps it up until ui_loading_done() clears the flag after the load.
+static char         g_loading_name[24];
+static volatile bool g_loading = false;
+
+void ui_loading(const char *name) {
+    strncpy(g_loading_name, name ? name : "", sizeof(g_loading_name) - 1);
+    g_loading_name[sizeof(g_loading_name) - 1] = 0;
+    g_loading = true;
+}
+void ui_loading_done(void) { g_loading = false; }
+
 // Song view: which instrument each channel is currently sounding.
 static void draw_song_view() {
     if (!display_ready || !g_player) return;
@@ -108,7 +122,10 @@ static void draw_menu() {
                 tft_lilfont_printf(1, y, TXT_PAL(rp), "%s%2d %s", cursor, ins, nm);
             } else {
                 char lbl[24]; track_label(idx, lbl, sizeof(lbl));
+                if (strlen(lbl) > 22) lbl[22] = 0;    // leave room for the right column
                 tft_lilfont_printf(1, y, TXT_PAL(rp), "%s%s", cursor, lbl);
+                char info[8]; track_info(idx, info, sizeof(info));
+                if (info[0]) tft_lilfont_printf(28 - strlen(info), y, TXT_PAL(rp), "%s", info);
             }
         } else {
             const MenuItem &it = menu_cur->items[idx];
@@ -143,6 +160,14 @@ void draw_ui() {
     if (millis() - ui_t0 < 120) return;   // ~8 fps refresh
     ui_t0 = millis();
 
+    if (g_loading) {                        // loading dialog over everything
+        tft_tile_clear();
+        tft_lilfont_printf(1, 11, TXT_PAL(1), "LOADING...");
+        tft_lilfont_printf(1, 14, TXT_PAL(0), "%s", g_loading_name);
+        for (uint8_t y = 0; y < 30; y++) tft_tile_render(y, 0, 0);
+        tft_tile_sendLine(29*8, 0);
+        return;
+    }
     if (menu_open) { draw_menu(); return; }   // menu replaces the status page
     if (song_playing) { draw_song_view(); return; }   // channel view while the song plays
 

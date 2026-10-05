@@ -115,7 +115,10 @@ static void menu_nav(bool up, bool rt, bool dn, bool lf) {
         if (n > 0) {
                 if (up && !dn && !u_was) menu_sel = (menu_sel + n - 1) % n;
             if (dn && !up && !d_was) menu_sel = (menu_sel + 1) % n;
-            if (lf && !l_was) menu_back();   // L = back in these list submenus
+            if (lf && !l_was) {
+                if (menu_cur == &MENU_TRACK && track_back()) { menu_sel = 0; }  // up one folder
+                else menu_back();            // L = back in these list submenus
+            }
             if (rt && !r_was) {
                 if (menu_cur == &MENU_INST) {
                     cur_inst = inst_number(menu_sel);

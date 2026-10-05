@@ -60,8 +60,11 @@ static spi_flash_mmap_handle_t g_mmap;
 static uint8_t *g_sdbuf = nullptr;      // SD track load buffer
 static uint32_t g_sdlen = 0;
 static bool     sd_mounted = false;
-static char     sd_names[16][24];        // track files found on the card
-static char     sd_paths[16][64];
+static char     sd_browse[64] = "";      // current folder (relative to card root, "" = root)
+static char     sd_names[40][24];        // entry names in the browse folder
+static char     sd_paths[40][96];        // full path for fopen/opendir
+static bool     sd_isdir[40];            // entry is a folder (enterable)
+static uint32_t sd_size[40];             // file size (bytes); 0 for folders
 static int      n_sd = 0;
 static TaskHandle_t g_render_task = nullptr;
 static TaskHandle_t g_i2s_task = nullptr;
@@ -502,25 +505,82 @@ void mount_sd(void) {
     }
 }
 
+// Scan the current browse folder: folders first, then track files,
+// each group alphabetical.
 void scan_sd(void) {
     n_sd = 0;
-    if (!sd_mounted) return;
-    DIR *d = opendir("/sdcard");
-    if (!d) return;
+    if (!strcmp(sd_browse, "/flash")) {          // virtual folder: the 2 flash tracks
+        for (int i = 0; i < 2; i++) {
+            snprintf(sd_names[i], sizeof(sd_names[0]), "%s", TRACK_NAMES[i]);
+            sd_isdir[i] = false;
+            const esp_partition_t *part = esp_partition_find_first(
+                ESP_PARTITION_TYPE_DATA, (esp_partition_subtype_t)0x40, TRACK_LABELS[i]);
+            sd_size[i] = part ? part->size : 0;
+        }
+        n_sd = 2;
+        Serial.println("[sd] 2 flash tracks");
+        return;
+    }
+    if (!sd_browse[0]) {                         // card root: virtual "Flash Tracks" folder first
+        snprintf(sd_names[0], sizeof(sd_names[0]), "Flash Tracks");
+        snprintf(sd_paths[0], sizeof(sd_paths[0]), "/flash");
+        sd_isdir[0] = true;
+        sd_size[0] = 0;
+        n_sd = 1;
+    }
+    if (!sd_mounted) return;                     // no card: only the virtual folder shows
+    char dir[96];
+    snprintf(dir, sizeof(dir), "/sdcard%s%s", sd_browse[0] ? "/" : "", sd_browse);
+    DIR *d = opendir(dir);
+    if (!d) {
+        Serial.printf("[sdscan] opendir('%s') FAILED errno=%d\n", dir, errno);
+        sd_browse[0] = 0;   // folder vanished: back to root
+        scan_sd();
+        return;
+    }
     struct dirent *e;
-    while ((e = readdir(d)) && n_sd < 16) {
+    while ((e = readdir(d)) && n_sd < 40) {
         const char *n = e->d_name;
-        size_t len = strlen(n);
-        bool ok = len > 4 && len < 23 &&
-            (!strcasecmp(n + len - 3, ".xm") || !strcasecmp(n + len - 3, ".s3m") ||
-             !strcasecmp(n + len - 3, ".mod"));
-        if (!ok) continue;
-        snprintf(sd_names[n_sd], sizeof(sd_names[0]), "%s", n);
-        snprintf(sd_paths[n_sd], sizeof(sd_paths[0]), "/sdcard/%s", n);
-        n_sd++;
+        if (n[0] == '.') continue;                       // hidden/junk
+        char sub[96];
+        snprintf(sub, sizeof(sub), "%s/%s", dir, n);
+        struct stat st;
+        if (stat(sub, &st) != 0) continue;
+        if (S_ISDIR(st.st_mode)) {
+            if (strlen(n) > 22) continue;
+            // insertion sort: folders before files, alphabetical
+            int i = 0;
+            while (i < n_sd && strcasecmp(sd_names[i], n) < 0) i++;
+            for (int j = n_sd; j > i; j--) {
+                strcpy(sd_names[j], sd_names[j-1]); strcpy(sd_paths[j], sd_paths[j-1]);
+                sd_isdir[j] = sd_isdir[j-1]; sd_size[j] = sd_size[j-1];
+            }
+            snprintf(sd_names[i], sizeof(sd_names[0]), "%s", n);
+            snprintf(sd_paths[i], sizeof(sd_paths[0]), "%s", sub);
+            sd_isdir[i] = true;
+            sd_size[i] = 0;
+            n_sd++;
+        } else {
+            const char *dot = strrchr(n, '.');
+            bool ok = dot && (!strcasecmp(dot, ".xm") || !strcasecmp(dot, ".s3m") ||
+                              !strcasecmp(dot, ".mod"));
+            if (!ok) continue;
+            // append after the current entries (folders land before files
+            // because a later folder's sorted insert shifts everything right)
+            int at = n_sd;
+            for (int j = at; j > n_sd; j--) {
+                strcpy(sd_names[j], sd_names[j-1]); strcpy(sd_paths[j], sd_paths[j-1]);
+                sd_isdir[j] = sd_isdir[j-1]; sd_size[j] = sd_size[j-1];
+            }
+            snprintf(sd_names[at], sizeof(sd_names[0]), "%s", n);
+            snprintf(sd_paths[at], sizeof(sd_paths[0]), "%s", sub);
+            sd_isdir[at] = false;
+            sd_size[at] = st.st_size;
+            n_sd++;
+        }
     }
     closedir(d);
-    Serial.printf("[sd] %d track file(s)\n", n_sd);
+    Serial.printf("[sd] %d entries in %s/\n", n_sd, sd_browse[0] ? sd_browse : "(root)");
 }
 
 // Load a module file from the SD card into PSRAM and play it.
@@ -564,17 +624,72 @@ int inst_number(int idx) {   // 0-based playable index -> 1-based instrument num
 }
 
 // ---- track list hooks (2 flash partitions + SD files) ----
-int track_count(void) { return 2 + n_sd; }
+int track_count(void) { return n_sd; }   // entries include the virtual Flash Tracks folder
 void track_label(int i, char *buf, int bl) {
-    if (i < 2) snprintf(buf, bl, "%s", TRACK_NAMES[i]);
-    else       snprintf(buf, bl, "%s", sd_names[i - 2]);
+    if (i < 0 || i >= n_sd) { buf[0] = 0; return; }
+    const int e = i;
+    snprintf(buf, bl, "%s%s", sd_names[e], sd_isdir[e] ? "/" : "");
 }
+// Right-column info for the LOAD TRACK list: "D" for folders, size for files.
+void track_info(int i, char *buf, int bl) {
+    if (i < 0 || i >= n_sd) { buf[0] = 0; return; }
+    const int e = i;
+    if (sd_isdir[e]) { snprintf(buf, bl, "D"); return; }
+    uint32_t sz = sd_size[e];
+    if (sz >= (1024u*1024u))      snprintf(buf, bl, "%uM", (unsigned)((sz + (512u*1024u)) >> 20));
+    else if (sz >= 1024u)         snprintf(buf, bl, "%uK", (unsigned)((sz + 512u) >> 10));
+    else                          snprintf(buf, bl, "%u", (unsigned)sz);
+}
+
+// L inside LOAD TRACK: go up one folder. Returns true if consumed.
+bool track_back(void) {
+    if (!strcmp(sd_browse, "/flash")) {          // L: out of the virtual folder
+        sd_browse[0] = 0;
+        scan_sd();
+        return true;
+    }
+    if (!sd_browse[0]) return false;
+    char *slash = strrchr(sd_browse, '/');
+    if (slash) *slash = 0; else sd_browse[0] = 0;
+    scan_sd();
+    Serial.printf("[sd] folder %s/\n", sd_browse[0] ? sd_browse : "(root)");
+    return true;
+}
+static void show_loading(const char *name) {
+    Serial.printf("[load] %s...\n", name); Serial.flush();
+    ui_loading(name);
+}
+
 void track_select(int i) {
-    if (i < 2) {
-        if (g_track != i) { g_track = i; load_track(); }
-        Serial.printf("[menu] track %d: %s\n", g_track + 1, TRACK_NAMES[g_track]);
-    } else {
-        load_sd_track(sd_paths[i - 2]);
+    if (!strcmp(sd_browse, "/flash")) {          // virtual folder: flash track selected
+        if (i >= 0 && i < 2) {
+            const int e = i;
+            show_loading(sd_names[e]);
+            if (g_track != e) { g_track = e; load_track(); }
+            Serial.printf("[menu] track %d: %s\n", g_track + 1, TRACK_NAMES[g_track]);
+            ui_loading_done();
+        }
+    } else if (i < n_sd) {
+        const int e = i;
+        if (sd_isdir[e]) {                       // enter the folder
+            if (!strcmp(sd_paths[e], "/flash")) {    // virtual folder
+                snprintf(sd_browse, sizeof(sd_browse), "/flash");
+                scan_sd();
+                Serial.println("[sd] folder Flash Tracks/");
+                return;
+            }
+            char rel[48];
+            snprintf(rel, sizeof(rel), "%s%s%s", sd_browse[0] ? "/" : "", sd_browse, sd_paths[e] + strlen("/sdcard"));
+            // rebuild relative path of the entered dir from its full path
+            const char *full = sd_paths[e];
+            snprintf(sd_browse, sizeof(sd_browse), "%s", full + strlen("/sdcard") + 1);
+            scan_sd();
+            Serial.printf("[sd] folder %s/\n", sd_browse);
+            return;
+        }
+        show_loading(sd_names[e]);
+        load_sd_track(sd_paths[e]);
+        ui_loading_done();
     }
 }
 

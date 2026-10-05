@@ -11,6 +11,8 @@ extern bool display_ready;   // display came up at boot (mount_sd waits for it)
 void display_init();         // init tft + tile engine + palettes + bg
 void draw_ui();              // one throttled frame (menu / song view / status)
 void ui_task(void *arg);     // endless draw loop (spawned by setup)
+void ui_loading(const char *name);  // show "LOADING <name>" on next UI pass
+void ui_loading_done(void);         // clear it (call after the load finishes)
 
 // Transparent-text palette helper: TRANSPARENT_TILE (0x20) makes glyph
 // background pixels (b==0) keep the layer below.
