@@ -33,7 +33,7 @@ static void draw_screen_border() {
 static void drawGrid() {
     for (size_t y = 0; y < 30; y++) {
         for (size_t x = 0; x < 30; x++) {
-            tft_tile_putBackgoundGFX(x, y, 0, &gfx_tiles[0x13*0x18]);
+            tft_tile_putBackgoundGFX(x, y, 3, &gfx_tiles[0x13*0x18]);
         }
     }
 }
@@ -49,7 +49,9 @@ void display_init() {
     tft_tile_putPalette(0, TFT_BLACK, TFT_BLACK, tft_color565(0x28, 0x38, 0x88), TFT_RED);
     tft_tile_putPalette(1, tft_color565(0x28, 0x38, 0x88), tft_color565(0xF8, 0xF8, 0xF8), tft_color565(0xB8, 0xB8, 0xB8), tft_color565(0x60, 0x60, 0x60));
     tft_tile_putPalette(2, tft_color565(0x00, 0x00, 0x00), tft_color565(0x88, 0xe8, 0x10), tft_color565(0x00, 0x00, 0xb0), tft_color565(0x00, 0x00, 0x68));
-    tft_tile_putPalette(3, tft_color565(0x00, 0x00, 0x80), tft_color565(0x00, 0x00, 0xd8), tft_color565(0x00, 0x00, 0x90), tft_color565(0x00, 0x00, 0x48));
+    // palette 3 = grid palette: the grid tile's line pixels are color index 2
+    // (not 3), so dark gray goes in slot 2
+    tft_tile_putPalette(3, TFT_BLACK, TFT_BLACK, tft_color565(0x0a, 0x0a, 0x0a), TFT_RED);
 
     draw_screen_border();
     drawGrid();
